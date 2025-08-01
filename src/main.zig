@@ -167,11 +167,7 @@ fn runCli(database: *wild.WILD, static_alloc: *static_allocator.StaticAllocator)
                 .stats => {
                     const stats = database.getStats();
                     std.debug.print("Database Statistics:\n", .{});
-                    std.debug.print("- Used capacity: {}/{} ({d:.1}%)\n", .{
-                        stats.used_capacity,
-                        stats.total_capacity,
-                        @as(f64, @floatFromInt(stats.used_capacity)) / @as(f64, @floatFromInt(stats.total_capacity)) * 100
-                    });
+                    std.debug.print("- Used capacity: {}/{} ({d:.1}%)\n", .{ stats.used_capacity, stats.total_capacity, @as(f64, @floatFromInt(stats.used_capacity)) / @as(f64, @floatFromInt(stats.total_capacity)) * 100 });
                     std.debug.print("- Optimal batch size: {}\n", .{stats.optimal_batch_size});
                     std.debug.print("- Physical cores: {}\n", .{stats.physical_cores});
                     std.debug.print("- Cache line size: {} bytes\n", .{stats.cache_line_size});
@@ -244,7 +240,7 @@ pub fn main() !void {
     const available_cache_bytes = detected_cache_mb * 1024 * 1024;
     const target_capacity = @as(u64, @intFromFloat(@as(f64, @floatFromInt(available_cache_bytes)) * 0.75 / @as(f64, @floatFromInt(record_size)))); // 75% load factor
 
-    std.debug.print("Detected: {} MB L3 cache, {} records capacity\n", .{detected_cache_mb, target_capacity});
+    std.debug.print("Detected: {} MB L3 cache, {} records capacity\n", .{ detected_cache_mb, target_capacity });
     std.debug.print("Type 'help' for commands\n\n", .{});
 
     // Initialize database with calculated capacity
@@ -262,4 +258,3 @@ pub fn main() !void {
 
     runCli(&database, &static_alloc);
 }
-
