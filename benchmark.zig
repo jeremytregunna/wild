@@ -85,15 +85,27 @@ fn runSingleOperationBenchmarks(database: *wild.WILD, allocator: std.mem.Allocat
     var keys = try allocator.alloc(u64, num_operations);
     defer allocator.free(keys);
 
+    // Pre-allocate all test data strings to avoid allocPrint during benchmarks
+    var prep_data = try allocator.alloc([]u8, num_operations);
+    defer {
+        for (prep_data) |data| allocator.free(data);
+        allocator.free(prep_data);
+    }
+
+    var write_data = try allocator.alloc([]u8, num_operations);
+    defer {
+        for (write_data) |data| allocator.free(data);
+        allocator.free(write_data);
+    }
+
     // Prepare test data
     for (0..num_operations) |i| {
         keys[i] = @as(u64, i + 1);
+        prep_data[i] = try std.fmt.allocPrint(allocator, "test_data_{}", .{i});
+        write_data[i] = try std.fmt.allocPrint(allocator, "write_test_{}", .{keys[i] + num_operations});
 
-        const test_data = try std.fmt.allocPrint(allocator, "test_data_{}", .{i});
-        defer allocator.free(test_data);
-
-        // No need to create records manually - write directly to database
-        try database.write(keys[i], test_data);
+        // Write preparation data to database
+        try database.write(keys[i], prep_data[i]);
     }
 
     std.debug.print("Write test: ", .{});
@@ -101,9 +113,7 @@ fn runSingleOperationBenchmarks(database: *wild.WILD, allocator: std.mem.Allocat
 
     for (keys, 0..) |_, i| {
         const key = @as(u64, num_operations + 1 + i);
-        const test_data = try std.fmt.allocPrint(allocator, "write_test_{}", .{key});
-        defer allocator.free(test_data);
-        try database.write(key, test_data);
+        try database.write(key, write_data[i]);
     }
 
     const write_end = std.time.nanoTimestamp();
@@ -154,22 +164,28 @@ fn runBatchOperationBenchmarks(database: *wild.WILD, allocator: std.mem.Allocato
     var batch_keys = try allocator.alloc(u64, optimal_batch_size);
     defer allocator.free(batch_keys);
 
+    // Pre-allocate batch data strings
+    var batch_data = try allocator.alloc([]u8, optimal_batch_size);
+    defer {
+        for (batch_data) |data| allocator.free(data);
+        allocator.free(batch_data);
+    }
+
     // Prepare batch data with completely different key space to avoid collisions
     for (0..optimal_batch_size) |i| {
         // Use a completely different key space that won't collide with single ops (keys 1-5000)
         // Start from a large offset and use incremental keys for better distribution
         const key = @as(u64, 1_000_000_000) + @as(u64, i); // Simple incremental keys in high range
         batch_keys[i] = key;
+        batch_data[i] = try std.fmt.allocPrint(allocator, "batch_data_{}", .{key});
     }
 
     std.debug.print("Batch write: ", .{});
     const batch_write_start = std.time.nanoTimestamp();
 
     for (0..num_batches) |_| {
-        for (batch_keys) |key| {
-            const test_data = try std.fmt.allocPrint(allocator, "batch_data_{}", .{key});
-            defer allocator.free(test_data);
-            try database.write(key, test_data);
+        for (batch_keys, 0..) |key, i| {
+            try database.write(key, batch_data[i]);
         }
     }
 
@@ -215,16 +231,28 @@ fn runMixedWorkloadBenchmark(database: *wild.WILD, allocator: std.mem.Allocator,
     var keys = try allocator.alloc(u64, batch_size);
     defer allocator.free(keys);
 
+    // Pre-allocate mixed workload data strings
+    var prep_data = try allocator.alloc([]u8, batch_size);
+    defer {
+        for (prep_data) |data| allocator.free(data);
+        allocator.free(prep_data);
+    }
+
+    var write_data = try allocator.alloc([]u8, batch_size);
+    defer {
+        for (write_data) |data| allocator.free(data);
+        allocator.free(write_data);
+    }
+
     // Prepare workload data with different key space
     for (0..batch_size) |i| {
         // Use yet another key space for mixed workload to avoid all previous keys
         keys[i] = @as(u64, 2_000_000_000) + @as(u64, i);
+        prep_data[i] = try std.fmt.allocPrint(allocator, "mixed_workload_{}", .{i});
+        write_data[i] = try std.fmt.allocPrint(allocator, "mixed_write_{}", .{keys[i]});
 
-        const test_data = try std.fmt.allocPrint(allocator, "mixed_workload_{}", .{i});
-        defer allocator.free(test_data);
-
-        // No need to create records manually - write directly to database
-        try database.write(keys[i], test_data);
+        // Write preparation data to database
+        try database.write(keys[i], prep_data[i]);
     }
 
     // Data is already written to database, just use keys for mixed workload
@@ -247,11 +275,9 @@ fn runMixedWorkloadBenchmark(database: *wild.WILD, allocator: std.mem.Allocator,
             database.readBatch(keys, read_results);
             read_count += batch_size;
         } else {
-            // Individual writes (for now until we implement writeBatchData)
-            for (keys) |key| {
-                const test_data = try std.fmt.allocPrint(allocator, "mixed_write_{}", .{key});
-                defer allocator.free(test_data);
-                try database.write(key, test_data);
+            // Individual writes using pre-allocated data
+            for (keys, 0..) |key, i| {
+                try database.write(key, write_data[i]);
             }
             write_count += batch_size;
         }
