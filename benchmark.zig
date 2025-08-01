@@ -40,6 +40,8 @@ pub fn main() !void {
     // Initialize WILD database with calculated capacity
     const config = wild.WILD.Config{
         .target_capacity = target_capacity,
+        .file_path = "benchmark_data.db", // Enable durability
+        .sync_policy = .write_back, // Use write-back for performance
     };
 
     var database = try wild.WILD.init(static_alloc.allocator(), config);
@@ -70,6 +72,11 @@ pub fn main() !void {
 
     // Final hardware report
     database.printHardwareReport();
+
+    // Force sync all data to disk before cleanup
+    std.debug.print("Syncing data to disk...\n", .{});
+    try database.forceSync();
+    std.debug.print("Sync completed.\n", .{});
 
     // Cleanup in correct order: database first, then static allocator
     static_alloc.transitionToDeinit();
