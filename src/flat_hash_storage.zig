@@ -220,10 +220,8 @@ pub const FlatHashStorage = struct {
     }
 
     pub fn clear(self: *Self) void {
-        // Mark all records as invalid and reset count
-        for (self.records) |*record| {
-            record.* = CacheLineRecord.initEmpty();
-        }
+        // Zero out all records with memset - much faster than looping
+        @memset(std.mem.sliceAsBytes(self.records), 0);
         self.count = 0;
     }
 
