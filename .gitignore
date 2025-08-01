@@ -1,0 +1,10 @@
+zig-out/
+zig-cache/
+.zig-cache/
+*.swp
+*.tmp
+*~
+*.o
+benchmark
+main
+.DS_Store
