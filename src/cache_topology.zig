@@ -119,7 +119,7 @@ fn parseCpuList(allocator: std.mem.Allocator, cpu_list_str: []const u8) ![]u32 {
     while (ranges.next()) |range| {
         if (std.mem.indexOf(u8, range, "-")) |dash_pos| {
             const start = try std.fmt.parseInt(u32, range[0..dash_pos], 10);
-            const end = try std.fmt.parseInt(u32, range[dash_pos + 1..], 10);
+            const end = try std.fmt.parseInt(u32, range[dash_pos + 1 ..], 10);
             var i = start;
             while (i <= end) : (i += 1) {
                 try cpus.append(i);
@@ -161,7 +161,7 @@ fn detectSmtSiblings(allocator: std.mem.Allocator, cpu_id: u32) !u32 {
 
 fn detectCacheLineSize() u32 {
     const builtin = @import("builtin");
-    
+
     if (builtin.cpu.arch == .x86_64) {
         // Use CPUID to get cache line size
         // CPUID leaf 1, EBX bits 15:8 contain cache line size in 8-byte units
@@ -169,22 +169,22 @@ fn detectCacheLineSize() u32 {
         var ebx_out: u32 = undefined;
         var ecx_out: u32 = undefined;
         var edx_out: u32 = undefined;
-        
+
         // CPUID leaf 1
         asm volatile ("cpuid"
             : [eax] "={eax}" (eax_out),
               [ebx] "={ebx}" (ebx_out),
               [ecx] "={ecx}" (ecx_out),
-              [edx] "={edx}" (edx_out)
+              [edx] "={edx}" (edx_out),
             : [leaf] "{eax}" (@as(u32, 1)),
-              [subleaf] "{ecx}" (@as(u32, 0))
+              [subleaf] "{ecx}" (@as(u32, 0)),
             : "memory"
         );
-        
+
         // Extract cache line size from EBX bits 15:8
         const cache_line_units = (ebx_out >> 8) & 0xFF;
         const cache_line_size = cache_line_units * 8;
-        
+
         // Validate reasonable cache line size
         return switch (cache_line_size) {
             16, 32, 64, 128, 256 => cache_line_size,
@@ -257,9 +257,9 @@ pub fn analyzeCacheTopology(allocator: std.mem.Allocator) !CacheTopology {
 
             var size_kb: u64 = 0;
             if (std.mem.endsWith(u8, size_str, "K")) {
-                size_kb = try std.fmt.parseInt(u64, size_str[0..size_str.len-1], 10);
+                size_kb = try std.fmt.parseInt(u64, size_str[0 .. size_str.len - 1], 10);
             } else if (std.mem.endsWith(u8, size_str, "M")) {
-                const mb = try std.fmt.parseInt(u64, size_str[0..size_str.len-1], 10);
+                const mb = try std.fmt.parseInt(u64, size_str[0 .. size_str.len - 1], 10);
                 size_kb = mb * 1024;
             }
 

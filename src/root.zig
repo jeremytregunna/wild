@@ -20,8 +20,6 @@ pub const flat_hash_storage = @import("flat_hash_storage.zig");
 pub const FlatHashStorage = flat_hash_storage.FlatHashStorage;
 pub const CacheLineRecord = flat_hash_storage.CacheLineRecord;
 
-
-
 test "cache topology analysis" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -37,13 +35,13 @@ test "cache topology analysis" {
     // Basic validation
     try testing.expect(topology.total_cpus > 0);
     try testing.expect(topology.shard_mappings.len > 0);
-    
+
     // Test key hashing and shard mapping
     const test_key = "test_key";
     const hash = CacheTopology.hashKey(test_key);
     const shard = topology.getShardForData(hash);
     try testing.expect(shard.shard_id < topology.shard_mappings.len);
-    
+
     // Test convenience method
     const shard2 = topology.getShardForKey(test_key);
     try testing.expect(shard.shard_id == shard2.shard_id);
