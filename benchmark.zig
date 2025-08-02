@@ -81,61 +81,65 @@ fn runSingleOperationBenchmarks(database: *wild.WILD, allocator: std.mem.Allocat
     std.debug.print("\nSingle Operations\n", .{});
 
     // Use half of max_records for each phase to stay within capacity
-    // const num_operations = max_records / 2;
-    var keys = try allocator.alloc(u64, max_records);
+    const num_operations = max_records / 2;
+    var keys = try allocator.alloc(u64, num_operations);
     defer allocator.free(keys);
 
-    const n_reads = max_records / 2;
-    const n_writes = max_records - n_reads;
-
     // Pre-allocate all test data strings to avoid allocPrint during benchmarks
-    var test_data = try allocator.alloc([]u8, max_records);
+    var prep_data = try allocator.alloc([]u8, num_operations);
     defer {
-        for (test_data) |data| allocator.free(data);
-        allocator.free(test_data);
+        for (prep_data) |data| allocator.free(data);
+        allocator.free(prep_data);
     }
 
-    // Prepare test data for both read and write
-    for (0..max_records) |i| {
+    var write_data = try allocator.alloc([]u8, num_operations);
+    defer {
+        for (write_data) |data| allocator.free(data);
+        allocator.free(write_data);
+    }
+
+    // Prepare test data
+    for (0..num_operations) |i| {
         keys[i] = @as(u64, i + 1);
-        if (i < n_reads) {
-            test_data[i] = try std.fmt.allocPrint(allocator, "test_data_{}", .{keys[i]});
-            try database.write(keys[i], test_data[i]);
-        } else {
-            test_data[i] = try std.fmt.allocPrint(allocator, "write_test_{}", .{keys[i]});
-        }
+        prep_data[i] = try std.fmt.allocPrint(allocator, "test_data_{}", .{i});
+        write_data[i] = try std.fmt.allocPrint(allocator, "write_test_{}", .{keys[i] + num_operations});
+
+        // Write preparation data to database
+        try database.write(keys[i], prep_data[i]);
     }
 
     std.debug.print("Write test: ", .{});
     const write_start = std.time.nanoTimestamp();
 
-    for (n_reads..max_records) |index| {
-        try database.write(keys[index], test_data[index]);
+    for (keys, 0..) |_, i| {
+        const key = @as(u64, num_operations + 1 + i);
+        try database.write(key, write_data[i]);
     }
 
     const write_end = std.time.nanoTimestamp();
     const write_duration = @as(f64, @floatFromInt(write_end - write_start)) / 1_000_000_000.0;
-    const write_ops_per_sec = @as(f64, @floatFromInt(n_writes)) / write_duration;
+    const write_ops_per_sec = @as(f64, @floatFromInt(num_operations)) / write_duration;
 
-    std.debug.print("{} ops in {d:.3}s = {d:.0} ops/sec\n", .{ n_writes, write_duration, write_ops_per_sec });
+    std.debug.print("{} ops in {d:.3}s = {d:.0} ops/sec\n", .{ num_operations, write_duration, write_ops_per_sec });
 
     std.debug.print("Read test:  ", .{});
-    var successful_reads: u32 = 0;
     const read_start = std.time.nanoTimestamp();
-    for (1..n_reads + 1) |key| {
+
+    var successful_reads: u32 = 0;
+    for (keys) |key| {
         const result = try database.read(key);
         if (result != null) successful_reads += 1;
     }
 
     const read_end = std.time.nanoTimestamp();
     const read_duration = @as(f64, @floatFromInt(read_end - read_start)) / 1_000_000_000.0;
-    const read_ops_per_sec = @as(f64, @floatFromInt(n_reads)) / read_duration;
+    const read_ops_per_sec = @as(f64, @floatFromInt(num_operations)) / read_duration;
 
-    std.debug.print("{} ops in {d:.3}s = {d:.0} ops/sec ({} found)\n", .{ n_reads, read_duration, read_ops_per_sec, successful_reads });
+    std.debug.print("{} ops in {d:.3}s = {d:.0} ops/sec ({} found)\n", .{ num_operations, read_duration, read_ops_per_sec, successful_reads });
 
     // Latency measurements
-    const avg_write_latency = (write_duration * 1_000_000_000.0) / @as(f64, @floatFromInt(keys[max_records / 2 ..].len));
-    const avg_read_latency = (read_duration * 1_000_000_000.0) / @as(f64, @floatFromInt(max_records / 2));
+    const avg_write_latency = (write_duration * 1_000_000_000.0) / @as(f64, @floatFromInt(num_operations));
+    const avg_read_latency = (read_duration * 1_000_000_000.0) / @as(f64, @floatFromInt(num_operations));
 
     std.debug.print("Latency - Write: {d:.0}ns, Read: {d:.0}ns\n", .{ avg_write_latency, avg_read_latency });
 
@@ -192,18 +196,21 @@ fn runBatchOperationBenchmarks(database: *wild.WILD, allocator: std.mem.Allocato
     std.debug.print("{} ops in {d:.3}s = {d:.0} ops/sec\n", .{ total_operations, batch_write_duration, batch_write_ops_per_sec });
 
     std.debug.print("Batch read:  ", .{});
+    const batch_read_start = std.time.nanoTimestamp();
+
     // Allocate results array once
     const read_results = try allocator.alloc(?*const flat_hash_storage.CacheLineRecord, optimal_batch_size);
     defer allocator.free(read_results);
-    var total_found: u32 = 0;
 
-    const batch_read_start = std.time.nanoTimestamp();
+    var total_found: u32 = 0;
     for (0..num_batches) |_| {
         database.readBatch(batch_keys, read_results);
+
         for (read_results) |result| {
             if (result != null) total_found += 1;
         }
     }
+
     const batch_read_end = std.time.nanoTimestamp();
     const batch_read_duration = @as(f64, @floatFromInt(batch_read_end - batch_read_start)) / 1_000_000_000.0;
     const batch_read_ops_per_sec = @as(f64, @floatFromInt(total_operations)) / batch_read_duration;
@@ -260,7 +267,7 @@ fn runMixedWorkloadBenchmark(database: *wild.WILD, allocator: std.mem.Allocator,
 
     while (std.time.nanoTimestamp() < end_time) {
         // Alternate between batch reads and writes
-        if (total_operations & 1 == 0) {
+        if (total_operations % 2 == 0) {
             // Batch read - allocate results array
             const read_results = try allocator.alloc(?*const flat_hash_storage.CacheLineRecord, batch_size);
             defer allocator.free(read_results);
