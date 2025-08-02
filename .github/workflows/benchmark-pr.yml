@@ -1,4 +1,3 @@
-
 name: Benchmark Performance Analysis
 
 on:
@@ -20,53 +19,190 @@ jobs:
         with:
           version: 0.14.1
 
-      - name: Install perf
-        run: sudo apt-get update && sudo apt-get install -y linux-tools-common linux-tools-generic
+      - name: Install bc (for calculations)
+        run: sudo apt-get update && sudo apt-get install -y bc
 
-      - name: Build benchmark
-        run: zig build-exe -O ReleaseFast benchmark.zig
+      - name: Save current commit
+        run: echo "PR_COMMIT=$(git rev-parse HEAD)" >> $GITHUB_ENV
 
-      - name: Run perf analysis
+      - name: Run benchmark on master
         run: |
+<<<<<<< Updated upstream
           # Run perf and save output
           perf stat -e LLC-loads,LLC-load-misses,LLC-stores,LLC-store-misses ./benchmark 2> perf.txt || true
+=======
+          git fetch origin master
+          git checkout master
+          zig build-exe -O ReleaseFast benchmark.zig
+          ./benchmark > master_benchmark.txt 2>&1
+          git checkout ${{ env.PR_COMMIT }}
+
+      - name: Run benchmark on PR
+        run: |
+          zig build-exe -O ReleaseFast benchmark.zig
+          ./benchmark > pr_benchmark.txt 2>&1
+
+      - name: Parse and compare results
+        id: parse
+        run: |
+          # Function to extract ops/sec from benchmark output
+          extract_ops() {
+            grep "$1" "$2" | awk -F'=' '{print $2}' | awk '{print $1}' | tr -d '[:space:]'
+          }
+>>>>>>> Stashed changes
           
-          # Extract LLC miss rate
-          LLC_LOAD_MISSES=$(grep "LLC-load-misses" perf.txt | awk '{print $1}' | tr -d ',')
-          LLC_LOADS=$(grep "LLC-loads" perf.txt | awk '{print $1}' | tr -d ',')
-          if [ "$LLC_LOADS" -ne 0 ]; then
-            LLC_MISS_RATE=$(echo "scale=2; $LLC_LOAD_MISSES * 100 / $LLC_LOADS" | bc)
-          else
-            LLC_MISS_RATE="N/A"
-          fi
+          # Function to extract latency (ns) from benchmark output
+          extract_latency() {
+            grep "$1" "$2" | awk -F':' '{print $2}' | awk '{print $1}' | tr -d '[:space:]'
+          }
+          
+          # Extract master metrics
+          master_single_write=$(extract_ops "Write test:" master_benchmark.txt)
+          master_single_read=$(extract_ops "Read test:" master_benchmark.txt)
+          master_batch_write=$(extract_ops "Batch write:" master_benchmark.txt)
+          master_batch_read=$(extract_ops "Batch read:" master_benchmark.txt)
+          master_mixed=$(extract_ops "Mixed workload:" master_benchmark.txt)
+          
+          master_single_write_latency=$(extract_latency "Latency - Write" master_benchmark.txt | cut -d, -f1)
+          master_single_read_latency=$(extract_latency "Latency - Read" master_benchmark.txt | cut -d, -f1)
+          master_batch_write_latency=$(extract_latency "Batch latency - Write" master_benchmark.txt | cut -d, -f1)
+          master_batch_read_latency=$(extract_latency "Batch latency - Read" master_benchmark.txt | cut -d, -f1)
+          
+          # Extract PR metrics
+          pr_single_write=$(extract_ops "Write test:" pr_benchmark.txt)
+          pr_single_read=$(extract_ops "Read test:" pr_benchmark.txt)
+          pr_batch_write=$(extract_ops "Batch write:" pr_benchmark.txt)
+          pr_batch_read=$(extract_ops "Batch read:" pr_benchmark.txt)
+          pr_mixed=$(extract_ops "Mixed workload:" pr_benchmark.txt)
+          
+          pr_single_write_latency=$(extract_latency "Latency - Write" pr_benchmark.txt | cut -d, -f1)
+          pr_single_read_latency=$(extract_latency "Latency - Read" master_benchmark.txt | cut -d, -f1)
+          pr_batch_write_latency=$(extract_latency "Batch latency - Write" pr_benchmark.txt | cut -d, -f1)
+          pr_batch_read_latency=$(extract_latency "Batch latency - Read" pr_benchmark.txt | cut -d, -f1)
+          
+          # Calculate percentage changes (higher ops/sec = better, lower latency = better)
+          calc_change() {
+            local master=$1
+            local pr=$2
+            if [ -z "$master" ] || [ -z "$pr" ] || [ "$master" = "0" ]; then
+              echo "N/A"
+            else
+              echo "scale=2; ($pr - $master) * 100 / $master" | bc
+            fi
+          }
+          
+          calc_latency_change() {
+            local master=$1
+            local pr=$2
+            if [ -z "$master" ] || [ -z "$pr" ] || [ "$master" = "0" ]; then
+              echo "N/A"
+            else
+              echo "scale=2; ($master - $pr) * 100 / $master" | bc
+            fi
+          }
+          
+          # Calculate changes
+          single_write_change=$(calc_change $master_single_write $pr_single_write)
+          single_read_change=$(calc_change $master_single_read $pr_single_read)
+          batch_write_change=$(calc_change $master_batch_write $pr_batch_write)
+          batch_read_change=$(calc_change $master_batch_read $pr_batch_read)
+          mixed_change=$(calc_change $master_mixed $pr_mixed)
+          
+          single_write_latency_change=$(calc_latency_change $master_single_write_latency $pr_single_write_latency)
+          single_read_latency_change=$(calc_latency_change $master_single_read_latency $pr_single_read_latency)
+          batch_write_latency_change=$(calc_latency_change $master_batch_write_latency $pr_batch_write_latency)
+          batch_read_latency_change=$(calc_latency_change $master_batch_read_latency $pr_batch_read_latency)
+          
+          # Format results with signs
+          format_change() {
+            local change=$1
+            if [ "$change" = "N/A" ]; then
+              echo "N/A"
+            elif [[ $change == -* ]]; then
+              echo "$change%"
+            else
+              echo "+$change%"
+            fi
+          }
           
           # Save results as environment variables
-          echo "LLC_LOAD_MISSES=$LLC_LOAD_MISSES" >> $GITHUB_ENV
-          echo "LLC_LOADS=$LLC_LOADS" >> $GITHUB_ENV
-          echo "LLC_MISS_RATE=$LLC_MISS_RATE" >> $GITHUB_ENV
+          echo "master_single_write=$master_single_write" >> $GITHUB_ENV
+          echo "master_single_read=$master_single_read" >> $GITHUB_ENV
+          echo "master_batch_write=$master_batch_write" >> $GITHUB_ENV
+          echo "master_batch_read=$master_batch_read" >> $GITHUB_ENV
+          echo "master_mixed=$master_mixed" >> $GITHUB_ENV
+          echo "master_single_write_latency=$master_single_write_latency" >> $GITHUB_ENV
+          echo "master_single_read_latency=$master_single_read_latency" >> $GITHUB_ENV
+          echo "master_batch_write_latency=$master_batch_write_latency" >> $GITHUB_ENV
+          echo "master_batch_read_latency=$master_batch_read_latency" >> $GITHUB_ENV
+          
+          echo "pr_single_write=$pr_single_write" >> $GITHUB_ENV
+          echo "pr_single_read=$pr_single_read" >> $GITHUB_ENV
+          echo "pr_batch_write=$pr_batch_write" >> $GITHUB_ENV
+          echo "pr_batch_read=$pr_batch_read" >> $GITHUB_ENV
+          echo "pr_mixed=$pr_mixed" >> $GITHUB_ENV
+          echo "pr_single_write_latency=$pr_single_write_latency" >> $GITHUB_ENV
+          echo "pr_single_read_latency=$pr_single_read_latency" >> $GITHUB_ENV
+          echo "pr_batch_write_latency=$pr_batch_write_latency" >> $GITHUB_ENV
+          echo "pr_batch_read_latency=$pr_batch_read_latency" >> $GITHUB_ENV
+          
+          echo "single_write_change=$(format_change $single_write_change)" >> $GITHUB_ENV
+          echo "single_read_change=$(format_change $single_read_change)" >> $GITHUB_ENV
+          echo "batch_write_change=$(format_change $batch_write_change)" >> $GITHUB_ENV
+          echo "batch_read_change=$(format_change $batch_read_change)" >> $GITHUB_ENV
+          echo "mixed_change=$(format_change $mixed_change)" >> $GITHUB_ENV
+          echo "single_write_latency_change=$(format_change $single_write_latency_change)" >> $GITHUB_ENV
+          echo "single_read_latency_change=$(format_change $single_read_latency_change)" >> $GITHUB_ENV
+          echo "batch_write_latency_change=$(format_change $batch_write_latency_change)" >> $GITHUB_ENV
+          echo "batch_read_latency_change=$(format_change $batch_read_latency_change)" >> $GITHUB_ENV
 
       - name: Comment PR with results
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
-            const perfData = fs.readFileSync('perf.txt', 'utf8');
             
-            const comment = `## Performance Analysis Results (LLC Misses)
+            const formatMetric = (value, change) => {
+              if (change === 'N/A%') return value;
+              const sign = change.startsWith('+') ? '✅' : '❌';
+              return `${value} (${sign} ${change.replace('%', '')}%)`;
+            };
+            
+            const comment = `## Benchmark Performance Comparison
 
-            **LLC Load Misses**: ${process.env.LLC_LOAD_MISSES}
-            **LLC Loads**: ${process.env.LLC_LOADS}
-            **LLC Miss Rate**: ${process.env.LLC_MISS_RATE}%
+            | Metric | PR Branch | Master Branch | Change |
+            |--------|-----------|---------------|--------|
+            | **Single Write** | ${process.env.pr_single_write} ops/sec | ${process.env.master_single_write} ops/sec | ${formatMetric(process.env.pr_single_write, process.env.single_write_change)} |
+            | **Single Read** | ${process.env.pr_single_read} ops/sec | ${process.env.master_single_read} ops/sec | ${formatMetric(process.env.pr_single_read, process.env.single_read_change)} |
+            | **Batch Write** | ${process.env.pr_batch_write} ops/sec | ${process.env.master_batch_write} ops/sec | ${formatMetric(process.env.pr_batch_write, process.env.batch_write_change)} |
+            | **Batch Read** | ${process.env.pr_batch_read} ops/sec | ${process.env.master_batch_read} ops/sec | ${formatMetric(process.env.pr_batch_read, process.env.batch_read_change)} |
+            | **Mixed Workload** | ${process.env.pr_mixed} ops/sec | ${process.env.master_mixed} ops/sec | ${formatMetric(process.env.pr_mixed, process.env.mixed_change)} |
+            | **Single Write Latency** | ${process.env.pr_single_write_latency} ns | ${process.env.master_single_write_latency} ns | ${formatMetric(process.env.pr_single_write_latency, process.env.single_write_latency_change)} |
+            | **Single Read Latency** | ${process.env.pr_single_read_latency} ns | ${process.env.master_single_read_latency} ns | ${formatMetric(process.env.pr_single_read_latency, process.env.single_read_latency_change)} |
+            | **Batch Write Latency** | ${process.env.pr_batch_write_latency} ns | ${process.env.master_batch_write_latency} ns | ${formatMetric(process.env.pr_batch_write_latency, process.env.batch_write_latency_change)} |
+            | **Batch Read Latency** | ${process.env.pr_batch_read_latency} ns | ${process.env.master_batch_read_latency} ns | ${formatMetric(process.env.pr_batch_read_latency, process.env.batch_read_latency_change)} |
 
+            **Interpretation**:
+            - 🟢 **Green (positive %)**: Improvement in throughput or reduction in latency
+            - 🔴 **Red (negative %)**: Regression in throughput or increase in latency
+            
             <details>
-            <summary>Full perf output</summary>
+            <summary>Full Benchmark Output (PR Branch)</summary>
 
             \`\`\`
-            ${perfData}
+            ${fs.readFileSync('pr_benchmark.txt', 'utf8')}
             \`\`\`
             </details>
 
-            _Note: This analysis was performed using \`perf stat\` on the benchmark executable built with \`zig build-exe -O ReleaseFast\`_`;
+            <details>
+            <summary>Full Benchmark Output (Master Branch)</summary>
+
+            \`\`\`
+            ${fs.readFileSync('master_benchmark.txt', 'utf8')}
+            \`\`\`
+            </details>
+
+            _Note: This comparison was generated by running the benchmark on both branches using identical hardware conditions._`;
 
             github.rest.issues.createComment({
               issue_number: context.issue.number,
