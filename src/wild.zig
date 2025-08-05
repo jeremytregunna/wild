@@ -2,6 +2,7 @@ const std = @import("std");
 const cache_topology = @import("cache_topology.zig");
 const flat_hash_storage = @import("flat_hash_storage.zig");
 const static_allocator = @import("static_allocator.zig");
+const wal = @import("wal.zig");
 
 // WILD Database - Cache-Resident Ultra-High-Performance Key-Value Store
 pub const WILD = struct {
@@ -11,6 +12,9 @@ pub const WILD = struct {
     storage: flat_hash_storage.FlatHashStorage,
     cache_topology: *cache_topology.CacheTopology,
     allocator: std.mem.Allocator,
+
+    // Optional durability - null means no WAL
+    durability: ?wal.DurabilityManager,
 
     // Configuration
     target_capacity: u64,
@@ -52,11 +56,18 @@ pub const WILD = struct {
             .storage = storage,
             .cache_topology = topology_ptr,
             .allocator = allocator,
+            .durability = null, // Initially no WAL
             .target_capacity = config.target_capacity,
         };
     }
 
     pub fn deinit(self: *Self) void {
+        // Stop durability if enabled
+        if (self.durability) |*dur| {
+            dur.stop();
+            dur.deinit();
+        }
+
         // Note: Caller will transition static allocator to deinit state
         self.storage.deinit();
         self.cache_topology.deinit();
@@ -169,5 +180,55 @@ pub const WILD = struct {
     // Hash key utility - unified interface
     pub fn hashKey(key: anytype) u64 {
         return flat_hash_storage.hashKey(key);
+    }
+
+    // Enable durability with WAL - must be called during init phase
+    pub fn enableDurability(self: *Self, wal_config: wal.DurabilityManager.Config) !void {
+        std.debug.assert(self.durability == null); // Should only be called once
+
+        // Initialize durability manager using static allocator
+        self.durability = try wal.DurabilityManager.init(self.allocator, wal_config);
+
+        // Associate WAL with storage
+        self.storage.enableDurability(&self.durability.?);
+
+        // Start durability thread
+        try self.durability.?.start();
+    }
+
+    // Durability stats without ring buffer details
+    pub const DurabilityStatsSimple = struct {
+        batches_written: u64,
+        entries_dropped: u64,
+        total_entries_written: u64,
+        wal_size_bytes: u64,
+        pending_ios: u32,
+        completed_ios: u64,
+        io_errors: u64,
+    };
+
+    // Get durability statistics if enabled - no allocation version
+    pub fn getDurabilityStatsNoAlloc(self: *const Self) ?DurabilityStatsSimple {
+        if (self.durability) |*dur| {
+            const stats = dur.getStatsNoAlloc();
+            return DurabilityStatsSimple{
+                .batches_written = stats.batches_written,
+                .entries_dropped = stats.entries_dropped,
+                .total_entries_written = stats.total_entries_written,
+                .wal_size_bytes = stats.wal_size_bytes,
+                .pending_ios = stats.pending_ios,
+                .completed_ios = stats.completed_ios,
+                .io_errors = stats.io_errors,
+            };
+        }
+        return null;
+    }
+
+    // Get durability statistics if enabled - with allocation (init phase only)
+    pub fn getDurabilityStats(self: *const Self) !?wal.DurabilityManager.Stats {
+        if (self.durability) |*dur| {
+            return try dur.getStats(self.allocator);
+        }
+        return null;
     }
 };
