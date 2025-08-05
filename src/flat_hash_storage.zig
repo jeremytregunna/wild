@@ -249,6 +249,28 @@ pub const FlatHashStorage = struct {
         self.durability_manager = null;
     }
 
+    // Snapshot support: Copy all records atomically for snapshot creation
+    pub fn copyAllRecords(self: *const Self, dest_records: []CacheLineRecord) void {
+        std.debug.assert(dest_records.len >= self.records.len);
+
+        // Atomic copy of all records using memcpy - fastest approach
+        // This gives us a point-in-time snapshot of the entire storage
+        @memcpy(dest_records[0..self.records.len], self.records);
+    }
+
+    // Snapshot support: Restore a single record during recovery
+    pub fn restoreRecord(self: *Self, record: *const CacheLineRecord) !void {
+        if (!record.isValid()) return;
+
+        // Find the correct position for this record
+        const key = record.getKey();
+        const pos = self.findEmptySlot(key) orelse return error.TableFull;
+
+        // Restore the record
+        self.records[pos] = record.*;
+        self.count += 1;
+    }
+
     pub fn getStats(self: *const Self) StorageStats {
         return StorageStats{
             .total_count = self.count,

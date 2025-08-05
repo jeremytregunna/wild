@@ -3,6 +3,7 @@ const cache_topology = @import("cache_topology.zig");
 const flat_hash_storage = @import("flat_hash_storage.zig");
 const static_allocator = @import("static_allocator.zig");
 const wal = @import("wal.zig");
+const snapshot = @import("snapshot.zig");
 
 // WILD Database - Cache-Resident Ultra-High-Performance Key-Value Store
 pub const WILD = struct {
@@ -15,6 +16,9 @@ pub const WILD = struct {
 
     // Optional durability - null means no WAL
     durability: ?wal.DurabilityManager,
+
+    // Optional snapshots for recovery
+    snapshot_manager: ?snapshot.SnapshotManager,
 
     // Configuration
     target_capacity: u64,
@@ -57,6 +61,7 @@ pub const WILD = struct {
             .cache_topology = topology_ptr,
             .allocator = allocator,
             .durability = null, // Initially no WAL
+            .snapshot_manager = null, // Initially no snapshots
             .target_capacity = config.target_capacity,
         };
     }
@@ -66,6 +71,11 @@ pub const WILD = struct {
         if (self.durability) |*dur| {
             dur.stop();
             dur.deinit();
+        }
+
+        // Clean up snapshot manager if enabled
+        if (self.snapshot_manager) |*snap_mgr| {
+            snap_mgr.deinit();
         }
 
         // Note: Caller will transition static allocator to deinit state
@@ -230,5 +240,58 @@ pub const WILD = struct {
             return try dur.getStats(self.allocator);
         }
         return null;
+    }
+
+    // Enable snapshots for crash recovery - must be called during init phase
+    pub fn enableSnapshots(self: *Self, snapshot_config: snapshot.SnapshotManager.Config) !void {
+        std.debug.assert(self.snapshot_manager == null); // Should only be called once
+
+        // Initialize snapshot manager using static allocator
+        self.snapshot_manager = try snapshot.SnapshotManager.init(self.allocator, snapshot_config);
+    }
+
+    // Create a snapshot of current database state
+    pub fn createSnapshot(self: *Self) !void {
+        if (self.snapshot_manager) |*snap_mgr| {
+            const current_wal_position = if (self.durability) |*dur|
+                dur.wal_offset.load(.monotonic)
+            else
+                0;
+
+            try snap_mgr.createSnapshot(&self.storage, current_wal_position);
+        } else {
+            return error.SnapshotsNotEnabled;
+        }
+    }
+
+    // Perform crash recovery from snapshots + WAL replay
+    pub fn performRecovery(self: *Self, wal_file_path: []const u8) !void {
+        if (self.snapshot_manager) |*snap_mgr| {
+            var recovery_coordinator = snapshot.RecoveryCoordinator.init(self.allocator, snap_mgr, wal_file_path);
+
+            const final_wal_position = try recovery_coordinator.performRecovery(&self.storage);
+
+            // Update WAL offset if durability is enabled
+            if (self.durability) |*dur| {
+                dur.wal_offset.store(final_wal_position, .monotonic);
+            }
+        } else {
+            return error.SnapshotsNotEnabled;
+        }
+    }
+
+    // Check if automatic snapshot should be created
+    pub fn shouldCreateSnapshot(self: *const Self) bool {
+        if (self.snapshot_manager) |*snap_mgr| {
+            return snap_mgr.shouldCreateSnapshot();
+        }
+        return false;
+    }
+
+    // Create snapshot if it's time for one (called periodically)
+    pub fn maybeCreateSnapshot(self: *Self) !void {
+        if (self.shouldCreateSnapshot()) {
+            try self.createSnapshot();
+        }
     }
 };
