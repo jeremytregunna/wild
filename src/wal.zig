@@ -237,9 +237,22 @@ pub const DurabilityManager = struct {
     pub const Config = struct {
         wal_path: []const u8,
         max_threads: u32,
-        ring_buffer_size: u32,
+        ring_buffer_size: u32, // Should match storage capacity exactly
         batch_buffer_count: u32,
         io_uring_entries: u16, // Size of io_uring submission queue
+
+        // Create config with ring buffer sized to match storage capacity exactly
+        pub fn forStorage(wal_path: []const u8, storage_capacity: u32) Config {
+            // WAL ring buffer must match storage capacity exactly - every storable record gets a WAL slot
+            // Storage capacity is already power-of-2 from flat_hash_storage init
+            return Config{
+                .wal_path = wal_path,
+                .max_threads = 4,
+                .ring_buffer_size = storage_capacity, // 1:1 correspondence
+                .batch_buffer_count = @max(8, storage_capacity / 4096), // Scale batch buffers appropriately
+                .io_uring_entries = @intCast(@max(32, @min(storage_capacity / 1024, 512))), // Scale io_uring
+            };
+        }
     };
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
@@ -280,7 +293,10 @@ pub const DurabilityManager = struct {
         }
 
         // All buffers and completions start as available
-        const all_available = (@as(u32, 1) << @intCast(actual_buffer_count)) - 1;
+        const all_available = if (actual_buffer_count == 32)
+            0xFFFFFFFF // All 32 bits set
+        else
+            (@as(u32, 1) << @intCast(actual_buffer_count)) - 1;
 
         return Self{
             .wal_fd = wal_fd,

@@ -206,6 +206,13 @@ pub const WILD = struct {
         try self.durability.?.start();
     }
 
+    // Convenience method: enable durability with properly sized WAL for this storage
+    pub fn enableDurabilityForStorage(self: *Self, wal_path: []const u8) !void {
+        const storage_stats = self.storage.getStats();
+        const wal_config = wal.DurabilityManager.Config.forStorage(wal_path, storage_stats.total_capacity);
+        try self.enableDurability(wal_config);
+    }
+
     // Durability stats without ring buffer details
     pub const DurabilityStatsSimple = struct {
         batches_written: u64,

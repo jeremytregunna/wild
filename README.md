@@ -13,6 +13,7 @@ WILD is designed for modern x86-64 processors with the following characteristics
 - **Flat Hash Storage**: Linear probing hash table with no artificial capacity limits
 - **Zero Runtime Allocation**: Static allocator prevents allocation after initialization
 - **CPU Topology Detection**: Uses CPUID and `/sys/devices` to optimize for actual hardware
+- **Optional Durability**: Write-ahead log with io_uring for persistence when needed
 
 As a result, works best on Linux, but changing how caches are discovered to use cpuid could support other OSes.
 
@@ -54,12 +55,12 @@ WILD employs a three-state static allocator that transitions through init, stati
 
 ### Benchmark Results (Ryzen 9 7800X3D (8-core) x86-64, 96MB L3 Cache)
 
-| Operation Type | Latency | Throughput | vs Redis |
-|---|---|---|---|
-| **Single Read** | 3ns | 349.0M ops/sec | 8726x faster |
-| **Single Write** | 42ns | 23.6M ops/sec | 1180x faster |
-| **Batch Read** | 2ns per op | 620.1M ops/sec | - |
-| **Batch Write** | 28ns per op | 36.3M ops/sec | - |
+| Operation Type | Latency | Throughput |
+|---|---|---|
+| **Single Read** | 20ns | 349.0M ops/sec |
+| **Single Write** | 32ns | 23.6M ops/sec |
+| **Batch Read** | 2ns per op | 620.1M ops/sec |
+| **Batch Write** | 28ns per op | 36.3M ops/sec |
 
 ### Mixed Workload Performance
 
@@ -84,9 +85,7 @@ WILD employs a three-state static allocator that transitions through init, stati
 
 I will fully admit, these numbers are crazy stupid, run the benchmark on your system and see how fast it is to verify. These numbers are for a Ryzen 9 7800X3D (8-core) CPU with 96MB of L3 cache. You may need to lower the size if your system has less L3 cache.
 
-It also must be noted, that in its current state, data is never saved to the disk, and may get be evacuated from L3 cache by the OS. If that happens, there will be a drop in performance.
-
-Again, this is not a **durable database** it is only a **demonstration**.
+WILD now supports optional durability with a write-ahead log for persistence, while maintaining its ultra-high performance characteristics. Data may still be evacuated from L3 cache by the OS, which will impact performance, but is now recoverable on restart.
 
 ## Usage
 
@@ -109,14 +108,16 @@ Database Statistics:
 - Cache line size: 64 bytes
 ```
 
-### Benchmark Suite
+### Performance Testing
 ```bash
-$ ./benchmark
-# Runs comprehensive performance tests including:
-# - Single operation latency tests
-# - Batch operation throughput tests
-# - Mixed workload stress tests
-# - Hardware topology analysis
+# Quick performance validation
+$ zig run quick_benchmark.zig -O ReleaseFast
+
+# Comprehensive performance suite
+$ zig run performance_benchmark.zig -O ReleaseFast
+
+# Durability and recovery testing
+$ zig run recovery_benchmark.zig -O ReleaseFast
 ```
 
 ## Building
