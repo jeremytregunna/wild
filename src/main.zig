@@ -2,6 +2,7 @@
 const std = @import("std");
 const wild = @import("wild.zig");
 const static_allocator = @import("static_allocator.zig");
+const server = @import("server.zig");
 
 const Command = enum {
     set,
@@ -192,8 +193,59 @@ fn runCli(database: *wild.WILD, static_alloc: *static_allocator.StaticAllocator)
     database.deinit();
 }
 
+const ServerMode = struct {
+    enabled: bool = false,
+    bind_address: []const u8 = "",
+    port: u16 = 0,
+};
+
+fn parseArgs(allocator: std.mem.Allocator) !ServerMode {
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
+
+    var server_mode = ServerMode{};
+
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "-listen")) {
+            if (i + 1 >= args.len) {
+                std.debug.print("Error: -listen requires an address:port argument\n", .{});
+                return error.InvalidArguments;
+            }
+
+            const listen_addr = args[i + 1];
+            i += 1; // Skip the next argument
+
+            // Parse address:port
+            if (std.mem.lastIndexOf(u8, listen_addr, ":")) |colon_pos| {
+                // Copy the address string to avoid dangling pointer
+                const addr_slice = listen_addr[0..colon_pos];
+                const copied_addr = try allocator.dupe(u8, addr_slice);
+                server_mode.bind_address = copied_addr;
+                const port_str = listen_addr[colon_pos + 1 ..];
+                server_mode.port = std.fmt.parseInt(u16, port_str, 10) catch {
+                    std.debug.print("Error: Invalid port number: {s}\n", .{port_str});
+                    return error.InvalidPort;
+                };
+                server_mode.enabled = true;
+            } else {
+                std.debug.print("Error: -listen address must be in format address:port\n", .{});
+                return error.InvalidAddress;
+            }
+        }
+    }
+
+    return server_mode;
+}
+
 pub fn main() !void {
     const page_allocator = std.heap.page_allocator;
+
+    // Parse command line arguments
+    const server_mode = parseArgs(page_allocator) catch |err| {
+        std.debug.print("Usage: wild [-listen address:port]\n", .{});
+        return err;
+    };
 
     // Database arena allocator
     var database_arena = std.heap.ArenaAllocator.init(page_allocator);
@@ -203,7 +255,7 @@ pub fn main() !void {
     var static_alloc = static_allocator.StaticAllocator.init(database_arena.allocator());
     defer static_alloc.deinit();
 
-    std.debug.print("WILD CLI\n", .{});
+    // Don't print CLI banner here - will be printed conditionally
 
     // Detect cache topology to calculate proper capacity
     const cache_topology = @import("cache_topology.zig");
@@ -221,8 +273,9 @@ pub fn main() !void {
             return;
         };
 
-        static_alloc.transitionToStatic();
+        std.debug.print("WILD CLI\n", .{});
         std.debug.print("Type 'help' for commands\n\n", .{});
+        static_alloc.transitionToStatic();
         runCli(&database, &static_alloc);
         return;
     };
@@ -241,7 +294,6 @@ pub fn main() !void {
     const target_capacity = @as(u64, @intFromFloat(@as(f64, @floatFromInt(available_cache_bytes)) * 0.75 / @as(f64, @floatFromInt(record_size)))); // 75% load factor
 
     std.debug.print("Detected: {} MB L3 cache, {} records capacity\n", .{ detected_cache_mb, target_capacity });
-    std.debug.print("Type 'help' for commands\n\n", .{});
 
     // Initialize database with calculated capacity
     const config = wild.WILD.Config{
@@ -253,8 +305,15 @@ pub fn main() !void {
         return;
     };
 
-    // Transition to static state
-    static_alloc.transitionToStatic();
-
-    runCli(&database, &static_alloc);
+    if (server_mode.enabled) {
+        // Initialize server before transitioning to static state
+        var wild_server = try server.WildServer.init(&database, &static_alloc, server_mode.bind_address, server_mode.port);
+        static_alloc.transitionToStatic();
+        try wild_server.start();
+    } else {
+        std.debug.print("WILD CLI\n", .{});
+        std.debug.print("Type 'help' for commands\n\n", .{});
+        static_alloc.transitionToStatic();
+        runCli(&database, &static_alloc);
+    }
 }

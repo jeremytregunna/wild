@@ -91,7 +91,7 @@ WILD now supports optional durability with a write-ahead log for persistence, wh
 
 ### CLI Interface
 ```bash
-$ ./main
+$ ./wild
 WILD CLI
 Detected: 96 MB L3 cache, 1048576 records capacity
 Type 'help' for commands
@@ -106,6 +106,39 @@ Database Statistics:
 - Optimal batch size: 256
 - Physical cores: 8
 - Cache line size: 64 bytes
+```
+
+### Server Mode
+WILD can run as a high-performance server daemon supporting up to 100,000 concurrent connections using io_uring for async networking:
+
+```bash
+# Start server
+$ ./wild -listen 127.0.0.1:9999
+Detected: 96 MB L3 cache, 1179648 records capacity
+WILD server listening on 127.0.0.1:9999
+```
+
+The server uses a simple binary protocol optimized for cache-line storage with 8-byte hashed keys and max 52-byte values.
+
+### Client Interface
+Use the included client to interact with WILD servers:
+
+```bash
+# Set a key-value pair
+$ ./wild-client 127.0.0.1:9999 set name "John Doe"
+OK
+
+# Get a value
+$ ./wild-client 127.0.0.1:9999 get name
+John Doe
+
+# Delete a key
+$ ./wild-client 127.0.0.1:9999 delete name
+OK
+
+# Non-existent key
+$ ./wild-client 127.0.0.1:9999 get missing
+(nil)
 ```
 
 ### Performance Testing
@@ -123,8 +156,18 @@ $ zig run recovery_benchmark.zig -O ReleaseFast
 ## Building
 
 ```bash
-# Build CLI
-zig build-exe src/main.zig -O ReleaseSafe
+# Build both server and client binaries
+zig build
+
+# Or build manually
+zig build-exe src/main.zig -O ReleaseSafe --name wild
+zig build-exe src/client.zig -O ReleaseSafe --name wild-client
+
+# Run the server directly
+zig build run-server -- -listen 127.0.0.1:9999
+
+# Run the client directly  
+zig build run-client -- 127.0.0.1:9999 get test
 
 # Build benchmark (optimized for maximum performance)
 zig run benchmark.zig -O ReleaseFast -fstrip
