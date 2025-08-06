@@ -3,8 +3,8 @@ const cache_topology = @import("cache_topology.zig");
 
 // Cache-line-aligned record that fits exactly in one cache line
 pub const CacheLineRecord = extern struct {
-    metadata: u32, // 4 bytes: 1 bit valid flag + 6 bits length + 25 bits reserved (check first)
-    key: u64, // 8 bytes (check second for key comparison)
+    key: u64, // 8 bytes (check first for key comparison)
+    metadata: u32, // 4 bytes: 1 bit valid flag + 6 bits length + 25 bits reserved
     data: [52]u8, // 52 bytes data payload (accessed last)
     // Total: 64 bytes = exactly 1 cache line
 
@@ -72,6 +72,9 @@ pub fn hashKey(key: anytype) u64 {
     }
 }
 
+// Forward declaration for optional WAL
+const wal = @import("wal.zig");
+
 // Flat hash table with linear probing - no artificial capacity limits
 pub const FlatHashStorage = struct {
     const Self = @This();
@@ -81,6 +84,9 @@ pub const FlatHashStorage = struct {
     count: u32,
     topology: *const cache_topology.CacheTopology,
     allocator: std.mem.Allocator,
+
+    // Optional WAL for durability - null means no durability
+    durability_manager: ?*wal.DurabilityManager,
 
     // NUMA placement hints (for future optimization)
     numa_domains: u32,
@@ -118,6 +124,7 @@ pub const FlatHashStorage = struct {
             .count = 0,
             .topology = topology,
             .allocator = allocator,
+            .durability_manager = null, // Initially no WAL
             .numa_domains = numa_domains,
             .records_per_domain = records_per_domain,
         };
@@ -197,8 +204,15 @@ pub const FlatHashStorage = struct {
         const old_record = &self.records[pos];
         const is_update = old_record.isValid() and old_record.key == key;
 
-        // Create new record
+        // Critical path: update cache line (maintains 42ns performance)
         self.records[pos] = try CacheLineRecord.init(key, data);
+
+        // Always-async durability: never blocks
+        if (self.durability_manager) |dur_mgr| {
+            _ = dur_mgr.appendAsync(&self.records[pos]);
+            // Note: We ignore the return value to never block
+            // If WAL ring is full, the entry is dropped but write succeeds
+        }
 
         // Update count only for new insertions
         if (!is_update) {
@@ -223,6 +237,38 @@ pub const FlatHashStorage = struct {
         // Zero out all records with memset - much faster than looping
         @memset(std.mem.sliceAsBytes(self.records), 0);
         self.count = 0;
+    }
+
+    // Enable durability by associating with a WAL manager
+    pub fn enableDurability(self: *Self, durability_manager: *wal.DurabilityManager) void {
+        self.durability_manager = durability_manager;
+    }
+
+    // Disable durability
+    pub fn disableDurability(self: *Self) void {
+        self.durability_manager = null;
+    }
+
+    // Snapshot support: Copy all records atomically for snapshot creation
+    pub fn copyAllRecords(self: *const Self, dest_records: []CacheLineRecord) void {
+        std.debug.assert(dest_records.len >= self.records.len);
+
+        // Atomic copy of all records using memcpy - fastest approach
+        // This gives us a point-in-time snapshot of the entire storage
+        @memcpy(dest_records[0..self.records.len], self.records);
+    }
+
+    // Snapshot support: Restore a single record during recovery
+    pub fn restoreRecord(self: *Self, record: *const CacheLineRecord) !void {
+        if (!record.isValid()) return;
+
+        // Find the correct position for this record
+        const key = record.getKey();
+        const pos = self.findEmptySlot(key) orelse return error.TableFull;
+
+        // Restore the record
+        self.records[pos] = record.*;
+        self.count += 1;
     }
 
     pub fn getStats(self: *const Self) StorageStats {

@@ -2,6 +2,8 @@ const std = @import("std");
 const cache_topology = @import("cache_topology.zig");
 const flat_hash_storage = @import("flat_hash_storage.zig");
 const static_allocator = @import("static_allocator.zig");
+const wal = @import("wal.zig");
+const snapshot = @import("snapshot.zig");
 
 // WILD Database - Cache-Resident Ultra-High-Performance Key-Value Store
 pub const WILD = struct {
@@ -11,6 +13,12 @@ pub const WILD = struct {
     storage: flat_hash_storage.FlatHashStorage,
     cache_topology: *cache_topology.CacheTopology,
     allocator: std.mem.Allocator,
+
+    // Optional durability - null means no WAL
+    durability: ?wal.DurabilityManager,
+
+    // Optional snapshots for recovery
+    snapshot_manager: ?snapshot.SnapshotManager,
 
     // Configuration
     target_capacity: u64,
@@ -52,11 +60,24 @@ pub const WILD = struct {
             .storage = storage,
             .cache_topology = topology_ptr,
             .allocator = allocator,
+            .durability = null, // Initially no WAL
+            .snapshot_manager = null, // Initially no snapshots
             .target_capacity = config.target_capacity,
         };
     }
 
     pub fn deinit(self: *Self) void {
+        // Stop durability if enabled
+        if (self.durability) |*dur| {
+            dur.stop();
+            dur.deinit();
+        }
+
+        // Clean up snapshot manager if enabled
+        if (self.snapshot_manager) |*snap_mgr| {
+            snap_mgr.deinit();
+        }
+
         // Note: Caller will transition static allocator to deinit state
         self.storage.deinit();
         self.cache_topology.deinit();
@@ -169,5 +190,108 @@ pub const WILD = struct {
     // Hash key utility - unified interface
     pub fn hashKey(key: anytype) u64 {
         return flat_hash_storage.hashKey(key);
+    }
+
+    // Enable durability with WAL - must be called during init phase
+    pub fn enableDurability(self: *Self, wal_config: wal.DurabilityManager.Config) !void {
+        std.debug.assert(self.durability == null); // Should only be called once
+
+        // Initialize durability manager using static allocator
+        self.durability = try wal.DurabilityManager.init(self.allocator, wal_config);
+
+        // Associate WAL with storage
+        self.storage.enableDurability(&self.durability.?);
+
+        // Start durability thread
+        try self.durability.?.start();
+    }
+
+    // Durability stats without ring buffer details
+    pub const DurabilityStatsSimple = struct {
+        batches_written: u64,
+        entries_dropped: u64,
+        total_entries_written: u64,
+        wal_size_bytes: u64,
+        pending_ios: u32,
+        completed_ios: u64,
+        io_errors: u64,
+    };
+
+    // Get durability statistics if enabled - no allocation version
+    pub fn getDurabilityStatsNoAlloc(self: *const Self) ?DurabilityStatsSimple {
+        if (self.durability) |*dur| {
+            const stats = dur.getStatsNoAlloc();
+            return DurabilityStatsSimple{
+                .batches_written = stats.batches_written,
+                .entries_dropped = stats.entries_dropped,
+                .total_entries_written = stats.total_entries_written,
+                .wal_size_bytes = stats.wal_size_bytes,
+                .pending_ios = stats.pending_ios,
+                .completed_ios = stats.completed_ios,
+                .io_errors = stats.io_errors,
+            };
+        }
+        return null;
+    }
+
+    // Get durability statistics if enabled - with allocation (init phase only)
+    pub fn getDurabilityStats(self: *const Self) !?wal.DurabilityManager.Stats {
+        if (self.durability) |*dur| {
+            return try dur.getStats(self.allocator);
+        }
+        return null;
+    }
+
+    // Enable snapshots for crash recovery - must be called during init phase
+    pub fn enableSnapshots(self: *Self, snapshot_config: snapshot.SnapshotManager.Config) !void {
+        std.debug.assert(self.snapshot_manager == null); // Should only be called once
+
+        // Initialize snapshot manager using static allocator
+        self.snapshot_manager = try snapshot.SnapshotManager.init(self.allocator, snapshot_config);
+    }
+
+    // Create a snapshot of current database state
+    pub fn createSnapshot(self: *Self) !void {
+        if (self.snapshot_manager) |*snap_mgr| {
+            const current_wal_position = if (self.durability) |*dur|
+                dur.wal_offset.load(.monotonic)
+            else
+                0;
+
+            try snap_mgr.createSnapshot(&self.storage, current_wal_position);
+        } else {
+            return error.SnapshotsNotEnabled;
+        }
+    }
+
+    // Perform crash recovery from snapshots + WAL replay
+    pub fn performRecovery(self: *Self, wal_file_path: []const u8) !void {
+        if (self.snapshot_manager) |*snap_mgr| {
+            var recovery_coordinator = snapshot.RecoveryCoordinator.init(self.allocator, snap_mgr, wal_file_path);
+
+            const final_wal_position = try recovery_coordinator.performRecovery(&self.storage);
+
+            // Update WAL offset if durability is enabled
+            if (self.durability) |*dur| {
+                dur.wal_offset.store(final_wal_position, .monotonic);
+            }
+        } else {
+            return error.SnapshotsNotEnabled;
+        }
+    }
+
+    // Check if automatic snapshot should be created
+    pub fn shouldCreateSnapshot(self: *const Self) bool {
+        if (self.snapshot_manager) |*snap_mgr| {
+            return snap_mgr.shouldCreateSnapshot();
+        }
+        return false;
+    }
+
+    // Create snapshot if it's time for one (called periodically)
+    pub fn maybeCreateSnapshot(self: *Self) !void {
+        if (self.shouldCreateSnapshot()) {
+            try self.createSnapshot();
+        }
     }
 };
