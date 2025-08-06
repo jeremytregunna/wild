@@ -91,6 +91,7 @@ WILD now supports optional durability with a write-ahead log for persistence, wh
 
 ### CLI Interface
 ```bash
+# Basic CLI mode (in-memory only)
 $ ./wild
 WILD CLI
 Detected: 96 MB L3 cache, 1048576 records capacity
@@ -100,25 +101,47 @@ Type 'help' for commands
 OK
 > get name
 "John Doe"
-> stats
-Database Statistics:
-- Used capacity: 1/1048576 (0.0%)
-- Optimal batch size: 256
-- Physical cores: 8
-- Cache line size: 64 bytes
+
+# CLI mode with write-ahead log for durability
+$ ./wild -wal
+Enabling write-ahead log: wild.wal
+Attempting recovery from WAL...
+WILD CLI
+Type 'help' for commands
+
+> set name "John Doe"
+OK
+> get name  
+"John Doe"
+
+# CLI mode with custom WAL file path
+$ ./wild -wal /path/to/custom.wal
+Enabling write-ahead log: /path/to/custom.wal
 ```
 
 ### Server Mode
 WILD can run as a high-performance server daemon supporting up to 100,000 concurrent connections using io_uring for async networking:
 
 ```bash
-# Start server
+# Start server (in-memory only)
 $ ./wild -listen 127.0.0.1:9999
 Detected: 96 MB L3 cache, 1179648 records capacity
 WILD server listening on 127.0.0.1:9999
+
+# Start server with write-ahead log for durability
+$ ./wild -listen 127.0.0.1:9999 -wal
+Detected: 96 MB L3 cache, 1179648 records capacity
+Enabling write-ahead log: wild.wal
+Attempting recovery from WAL...
+WILD server listening on 127.0.0.1:9999
+
+# Server with custom WAL path
+$ ./wild -listen 127.0.0.1:9999 -wal /data/server.wal
+Enabling write-ahead log: /data/server.wal
+WILD server listening on 127.0.0.1:9999
 ```
 
-The server uses a simple binary protocol optimized for cache-line storage with 8-byte hashed keys and max 52-byte values.
+The server uses a simple binary protocol optimized for cache-line storage with 8-byte hashed keys and max 52-byte values. When using `-wal`, data persists across restarts and is automatically recovered on startup.
 
 ### Client Interface
 Use the included client to interact with WILD servers:
@@ -163,8 +186,8 @@ zig build
 zig build-exe src/main.zig -O ReleaseSafe --name wild
 zig build-exe src/client.zig -O ReleaseSafe --name wild-client
 
-# Run the server directly
-zig build run-server -- -listen 127.0.0.1:9999
+# Run the server directly with WAL
+zig build run-server -- -listen 127.0.0.1:9999 -wal
 
 # Run the client directly  
 zig build run-client -- 127.0.0.1:9999 get test

@@ -199,11 +199,17 @@ const ServerMode = struct {
     port: u16 = 0,
 };
 
-fn parseArgs(allocator: std.mem.Allocator) !ServerMode {
+const WalConfig = struct {
+    enabled: bool = false,
+    wal_path: []const u8 = "wild.wal",
+};
+
+fn parseArgs(allocator: std.mem.Allocator) !struct { server_mode: ServerMode, wal_config: WalConfig } {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
     var server_mode = ServerMode{};
+    var wal_config = WalConfig{};
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -232,20 +238,30 @@ fn parseArgs(allocator: std.mem.Allocator) !ServerMode {
                 std.debug.print("Error: -listen address must be in format address:port\n", .{});
                 return error.InvalidAddress;
             }
+        } else if (std.mem.eql(u8, args[i], "-wal")) {
+            wal_config.enabled = true;
+            // Check if next argument is a custom WAL path
+            if (i + 1 < args.len and !std.mem.startsWith(u8, args[i + 1], "-")) {
+                i += 1;
+                const copied_path = try allocator.dupe(u8, args[i]);
+                wal_config.wal_path = copied_path;
+            }
         }
     }
 
-    return server_mode;
+    return .{ .server_mode = server_mode, .wal_config = wal_config };
 }
 
 pub fn main() !void {
     const page_allocator = std.heap.page_allocator;
 
     // Parse command line arguments
-    const server_mode = parseArgs(page_allocator) catch |err| {
-        std.debug.print("Usage: wild [-listen address:port]\n", .{});
+    const args_result = parseArgs(page_allocator) catch |err| {
+        std.debug.print("Usage: wild [-listen address:port] [-wal [path]]\n", .{});
         return err;
     };
+    const server_mode = args_result.server_mode;
+    const wal_config = args_result.wal_config;
 
     // Database arena allocator
     var database_arena = std.heap.ArenaAllocator.init(page_allocator);
@@ -273,10 +289,46 @@ pub fn main() !void {
             return;
         };
 
-        std.debug.print("WILD CLI\n", .{});
-        std.debug.print("Type 'help' for commands\n\n", .{});
-        static_alloc.transitionToStatic();
-        runCli(&database, &static_alloc);
+        // Enable WAL if requested (fallback case)
+        if (wal_config.enabled) {
+            std.debug.print("Enabling write-ahead log: {s}\n", .{wal_config.wal_path});
+
+            // Enable snapshots (required for recovery)
+            const snapshot_config = @import("snapshot.zig").SnapshotManager.Config{
+                .snapshot_dir = "wild_snapshots",
+                .max_snapshots = 5,
+                .snapshot_interval_seconds = 300,
+            };
+            database.enableSnapshots(snapshot_config) catch |snap_err| {
+                std.debug.print("Failed to enable snapshots: {}\n", .{snap_err});
+                return;
+            };
+
+            // Enable WAL
+            database.enableDurabilityForStorage(wal_config.wal_path) catch |wal_err| {
+                std.debug.print("Failed to enable WAL: {}\n", .{wal_err});
+                return;
+            };
+
+            // Attempt recovery from existing WAL
+            std.debug.print("Attempting recovery from WAL...\n", .{});
+            database.performRecovery(wal_config.wal_path) catch |recovery_err| {
+                // Recovery failure is not fatal - might be first run or no previous data
+                std.debug.print("WAL recovery error: {} (likely first run or no previous data)\n", .{recovery_err});
+            };
+        }
+
+        if (server_mode.enabled) {
+            // Initialize server before transitioning to static state
+            var wild_server = try server.WildServer.init(&database, &static_alloc, server_mode.bind_address, server_mode.port);
+            static_alloc.transitionToStatic();
+            try wild_server.start();
+        } else {
+            std.debug.print("WILD CLI\n", .{});
+            std.debug.print("Type 'help' for commands\n\n", .{});
+            static_alloc.transitionToStatic();
+            runCli(&database, &static_alloc);
+        }
         return;
     };
 
@@ -304,6 +356,35 @@ pub fn main() !void {
         std.debug.print("Failed to initialize database: {}\n", .{err});
         return;
     };
+
+    // Enable WAL if requested
+    if (wal_config.enabled) {
+        std.debug.print("Enabling write-ahead log: {s}\n", .{wal_config.wal_path});
+
+        // Enable snapshots (required for recovery)
+        const snapshot_config = @import("snapshot.zig").SnapshotManager.Config{
+            .snapshot_dir = "wild_snapshots",
+            .max_snapshots = 5,
+            .snapshot_interval_seconds = 300,
+        };
+        database.enableSnapshots(snapshot_config) catch |snap_err| {
+            std.debug.print("Failed to enable snapshots: {}\n", .{snap_err});
+            return;
+        };
+
+        // Enable WAL
+        database.enableDurabilityForStorage(wal_config.wal_path) catch |wal_err| {
+            std.debug.print("Failed to enable WAL: {}\n", .{wal_err});
+            return;
+        };
+
+        // Attempt recovery from existing WAL
+        std.debug.print("Attempting recovery from WAL...\n", .{});
+        database.performRecovery(wal_config.wal_path) catch |recovery_err| {
+            // Recovery failure is not fatal - might be first run or no previous data
+            std.debug.print("WAL recovery error: {} (likely first run or no previous data)\n", .{recovery_err});
+        };
+    }
 
     if (server_mode.enabled) {
         // Initialize server before transitioning to static state
