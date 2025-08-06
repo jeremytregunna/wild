@@ -165,7 +165,6 @@ pub const ThreadLocalWAL = struct {
     }
 };
 
-// WAL completion following TigerBeetle patterns
 pub const WALCompletion = struct {
     next: ?*WALCompletion,
     batch: *WALBatch,
@@ -207,7 +206,7 @@ pub const DurabilityManager = struct {
     completions: []WALCompletion,
     completion_available: std.atomic.Value(u32), // Bitmask for available completions
 
-    // Completion queues following TigerBeetle pattern
+    // Completion queues
     unqueued: ?*WALCompletion,
     completed: ?*WALCompletion,
     awaiting: ?*WALCompletion,
@@ -377,7 +376,6 @@ pub const DurabilityManager = struct {
         return false;
     }
 
-    // Completion-based buffer management following TigerBeetle patterns
     fn getAvailableCompletion(self: *Self) ?*WALCompletion {
         const available = self.completion_available.load(.acquire);
         if (available == 0) return null;
@@ -416,7 +414,6 @@ pub const DurabilityManager = struct {
         }
     }
 
-    // Queue management following TigerBeetles patterns
     fn enqueueCompletion(self: *Self, head: *?*WALCompletion, completion: *WALCompletion, lock: *std.Thread.Mutex) void {
         _ = self;
         lock.lock();
@@ -677,7 +674,6 @@ pub const DurabilityManager = struct {
         _ = self.pending_ios.fetchAdd(1, .monotonic);
     }
 
-    // Process io_uring completions following TigerBeetle patterns
     fn processCompletions(self: *Self) !void {
         // First try to get existing completions without waiting
         if (self.ring.cq_ready() > 0) {
