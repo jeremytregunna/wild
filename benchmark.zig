@@ -122,7 +122,7 @@ fn runSingleOperationBenchmarks(database: *wild.WILD, allocator: std.mem.Allocat
     std.debug.print("Read test:  ", .{});
     var successful_reads: u32 = 0;
     const read_start = std.time.nanoTimestamp();
-    for (keys) |key| {
+    for (keys[0..n_reads]) |key| {
         const result = try database.read(key);
         if (result != null) successful_reads += 1;
     }
