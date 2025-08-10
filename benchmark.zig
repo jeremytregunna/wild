@@ -122,7 +122,7 @@ fn runSingleOperationBenchmarks(database: *wild.WILD, allocator: std.mem.Allocat
     std.debug.print("Read test:  ", .{});
     var successful_reads: u32 = 0;
     const read_start = std.time.nanoTimestamp();
-    for (1..n_reads + 1) |key| {
+    for (keys) |key| {
         const result = try database.read(key);
         if (result != null) successful_reads += 1;
     }
@@ -134,8 +134,8 @@ fn runSingleOperationBenchmarks(database: *wild.WILD, allocator: std.mem.Allocat
     std.debug.print("{} ops in {d:.3}s = {d:.0} ops/sec ({} found)\n", .{ n_reads, read_duration, read_ops_per_sec, successful_reads });
 
     // Latency measurements
-    const avg_write_latency = (write_duration * 1_000_000_000.0) / @as(f64, @floatFromInt(keys[max_records / 2 ..].len));
-    const avg_read_latency = (read_duration * 1_000_000_000.0) / @as(f64, @floatFromInt(max_records / 2));
+    const avg_write_latency = (write_duration * 1_000_000_000.0) / @as(f64, @floatFromInt(n_writes));
+    const avg_read_latency = (read_duration * 1_000_000_000.0) / @as(f64, @floatFromInt(n_reads));
 
     std.debug.print("Latency - Write: {d:.0}ns, Read: {d:.0}ns\n", .{ avg_write_latency, avg_read_latency });
 
