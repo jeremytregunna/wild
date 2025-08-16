@@ -271,6 +271,12 @@ pub const FlatHashStorage = struct {
         self.count += 1;
     }
 
+    // Get record at specific slot index (for snapshot creation)
+    pub fn getRecordAtSlot(self: *const Self, slot_index: u32) ?*const CacheLineRecord {
+        if (slot_index >= self.capacity) return null;
+        return &self.records[slot_index];
+    }
+
     pub fn getStats(self: *const Self) StorageStats {
         return StorageStats{
             .total_count = self.count,

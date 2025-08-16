@@ -4,6 +4,7 @@ const flat_hash_storage = @import("flat_hash_storage.zig");
 const static_allocator = @import("static_allocator.zig");
 const wal = @import("wal.zig");
 const snapshot = @import("snapshot.zig");
+const replication = @import("replication.zig");
 
 // WILD Database - Cache-Resident Ultra-High-Performance Key-Value Store
 pub const WILD = struct {
@@ -19,6 +20,10 @@ pub const WILD = struct {
 
     // Optional snapshots for recovery
     snapshot_manager: ?snapshot.SnapshotManager,
+
+    // Optional replication for read replicas and multi-writer
+    primary_replicator: ?replication.PrimaryReplicator,
+    replica_node: ?replication.ReplicaNode,
 
     // Configuration
     target_capacity: u64,
@@ -62,11 +67,21 @@ pub const WILD = struct {
             .allocator = allocator,
             .durability = null, // Initially no WAL
             .snapshot_manager = null, // Initially no snapshots
+            .primary_replicator = null, // Initially no replication
+            .replica_node = null, // Initially not a replica
             .target_capacity = config.target_capacity,
         };
     }
 
     pub fn deinit(self: *Self) void {
+        // Stop replication if enabled
+        if (self.primary_replicator) |*replicator| {
+            replicator.deinit();
+        }
+        if (self.replica_node) |*replica| {
+            replica.deinit();
+        }
+
         // Stop durability if enabled
         if (self.durability) |*dur| {
             dur.stop();
@@ -300,5 +315,94 @@ pub const WILD = struct {
         if (self.shouldCreateSnapshot()) {
             try self.createSnapshot();
         }
+    }
+
+    // Enable replication as primary node
+    pub fn enableReplicationAsPrimary(self: *Self, listen_port: u16) !void {
+        std.debug.assert(self.primary_replicator == null);
+        std.debug.assert(self.replica_node == null);
+        
+        // Must have durability enabled to replicate
+        if (self.durability == null) {
+            return error.DurabilityRequired;
+        }
+
+        // Initialize primary replicator
+        self.primary_replicator = try replication.PrimaryReplicator.init(
+            self.allocator,
+            &self.durability.?,
+            &self.storage,
+            listen_port,
+        );
+
+        // Set up WAL replicator for streaming batches
+        self.durability.?.setPrimaryReplicator(@ptrCast(&self.primary_replicator.?));
+
+        // Start replication
+        try self.primary_replicator.?.start();
+
+        // Replication enabled as primary
+    }
+
+    // Enable replication as replica node
+    pub fn enableReplicationAsReplica(self: *Self, primary_address: []const u8, primary_port: u16) !void {
+        std.debug.assert(self.primary_replicator == null);
+        std.debug.assert(self.replica_node == null);
+
+        // Initialize replica node
+        self.replica_node = try replication.ReplicaNode.init(
+            self.allocator,
+            self,
+            undefined, // static_alloc not needed for replica operations
+        );
+
+        // Connect to primary
+        try self.replica_node.?.connectToPrimary(primary_address, primary_port);
+
+        // Start replica
+        try self.replica_node.?.start();
+
+        // Replication enabled as replica
+    }
+
+    // Disable replication
+    pub fn disableReplication(self: *Self) void {
+        if (self.primary_replicator) |*replicator| {
+            replicator.deinit();
+            self.primary_replicator = null;
+            
+            // Remove WAL replicator
+            if (self.durability) |*dur| {
+                dur.removePrimaryReplicator();
+            }
+        }
+
+        if (self.replica_node) |*replica| {
+            replica.deinit();
+            self.replica_node = null;
+        }
+    }
+
+    // Get replication statistics
+    pub fn getReplicationStats(self: *const Self) ?union(enum) {
+        primary: replication.ReplicationStats,
+        replica: replication.ReplicaStats,
+    } {
+        if (self.primary_replicator) |*replicator| {
+            return .{ .primary = replicator.getStats() };
+        } else if (self.replica_node) |*replica| {
+            return .{ .replica = replica.getStats() };
+        }
+        return null;
+    }
+
+    // Check if this node is a primary
+    pub fn isPrimary(self: *const Self) bool {
+        return self.primary_replicator != null;
+    }
+
+    // Check if this node is a replica
+    pub fn isReplica(self: *const Self) bool {
+        return self.replica_node != null;
     }
 };
