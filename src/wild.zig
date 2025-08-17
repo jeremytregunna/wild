@@ -75,7 +75,7 @@ pub const WILD = struct {
 
     pub fn deinit(self: *Self) void {
         // CRITICAL SHUTDOWN ORDER - dependencies must be respected for performance and correctness
-        
+
         // 1. Stop replication first - replicators may depend on WAL for final batches
         if (self.primary_replicator) |*replicator| {
             replicator.deinit(); // Stops accepting new connections, flushes pending batches
@@ -86,7 +86,7 @@ pub const WILD = struct {
 
         // 2. Stop durability - WAL must be stopped after replication to avoid lost writes
         if (self.durability) |*dur| {
-            dur.stop();   // Flush remaining batches to disk
+            dur.stop(); // Flush remaining batches to disk
             dur.deinit(); // Close file handles, cleanup threads
         }
 
@@ -99,7 +99,7 @@ pub const WILD = struct {
         self.storage.deinit();
         self.cache_topology.deinit();
         self.allocator.destroy(self.cache_topology);
-        
+
         // Note: Caller handles static allocator and arena cleanup for performance
     }
 
@@ -324,7 +324,7 @@ pub const WILD = struct {
     pub fn enableReplicationAsPrimary(self: *Self, listen_port: u16, auth_secret: []const u8) !void {
         std.debug.assert(self.primary_replicator == null);
         std.debug.assert(self.replica_node == null);
-        
+
         // Must have durability enabled to replicate
         if (self.durability == null) {
             return error.DurabilityRequired;
@@ -374,7 +374,7 @@ pub const WILD = struct {
         if (self.primary_replicator) |*replicator| {
             replicator.deinit();
             self.primary_replicator = null;
-            
+
             // Remove WAL replicator
             if (self.durability) |*dur| {
                 dur.removePrimaryReplicator();

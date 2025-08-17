@@ -4,8 +4,8 @@ const std = @import("std");
 // Uses bit-packed header for efficient field encoding
 
 pub const WireMessage = extern struct {
-    packed_fields: u32,    // Bit-packed: message_type(4) + data_length(6) + status(3) + reserved(19)
-    key: u64,              // Database key
+    packed_fields: u32, // Bit-packed: message_type(4) + data_length(6) + status(3) + reserved(19)
+    key: u64, // Database key
 
     // Bit field constants
     const MESSAGE_TYPE_MASK: u32 = 0x0000000F;
@@ -41,9 +41,9 @@ pub const WireMessage = extern struct {
 
     pub fn init(msg_type: MessageType, key: u64, data_length: u32, status: Status) WireMessage {
         const packed_value = (@as(u32, @intFromEnum(msg_type)) << MESSAGE_TYPE_SHIFT) |
-                            (@as(u32, data_length) << DATA_LENGTH_SHIFT) |
-                            (@as(u32, @intFromEnum(status)) << STATUS_SHIFT);
-        
+            (@as(u32, data_length) << DATA_LENGTH_SHIFT) |
+            (@as(u32, @intFromEnum(status)) << STATUS_SHIFT);
+
         return WireMessage{
             .packed_fields = packed_value,
             .key = key,
@@ -66,7 +66,7 @@ pub const WireMessage = extern struct {
 
     pub fn setStatus(self: *WireMessage, status: Status) void {
         self.packed_fields = (self.packed_fields & ~STATUS_MASK) |
-                           (@as(u32, @intFromEnum(status)) << STATUS_SHIFT);
+            (@as(u32, @intFromEnum(status)) << STATUS_SHIFT);
     }
 };
 
@@ -87,7 +87,7 @@ pub const WireProtocol = struct {
         }
 
         const message = WireMessage.init(.auth_request, 0, @intCast(auth_secret.len), .success);
-        
+
         // Send header
         var bytes_sent = try std.posix.send(socket_fd, std.mem.asBytes(&message), 0);
         if (bytes_sent != HEADER_SIZE) {
@@ -106,7 +106,7 @@ pub const WireProtocol = struct {
     pub fn sendAuthResponse(socket_fd: std.posix.fd_t, success: bool) !void {
         const status: WireMessage.Status = if (success) .success else .error_auth_failed;
         const message = WireMessage.init(.auth_response, 0, 0, status);
-        
+
         const bytes_sent = try std.posix.send(socket_fd, std.mem.asBytes(&message), 0);
         if (bytes_sent != HEADER_SIZE) {
             return error.IncompleteWrite;
@@ -122,7 +122,7 @@ pub const WireProtocol = struct {
         }
 
         const message = std.mem.bytesToValue(WireMessage, &header_bytes);
-        
+
         if (message.getMessageType() != .auth_request) {
             return error.UnexpectedMessageType;
         }
@@ -154,7 +154,7 @@ pub const WireProtocol = struct {
         }
 
         const message = std.mem.bytesToValue(WireMessage, &header_bytes);
-        
+
         if (message.getMessageType() != .auth_response) {
             return error.UnexpectedMessageType;
         }
@@ -176,7 +176,7 @@ pub const WireProtocol = struct {
         }
 
         const message = WireMessage.init(.write_request, key, @intCast(data.len), .success);
-        
+
         // Send header
         var bytes_sent = try std.posix.send(socket_fd, std.mem.asBytes(&message), 0);
         if (bytes_sent != HEADER_SIZE) {
@@ -203,9 +203,9 @@ pub const WireProtocol = struct {
     pub fn sendReadResponse(socket_fd: std.posix.fd_t, key: u64, data: ?[]const u8) !void {
         const status: WireMessage.Status = if (data != null) .success else .not_found;
         const data_len: u32 = if (data) |d| @intCast(d.len) else 0;
-        
+
         const message = WireMessage.init(.read_response, key, data_len, status);
-        
+
         // Send header
         var bytes_sent = try std.posix.send(socket_fd, std.mem.asBytes(&message), 0);
         if (bytes_sent != HEADER_SIZE) {
@@ -224,7 +224,7 @@ pub const WireProtocol = struct {
     pub fn sendWriteResponse(socket_fd: std.posix.fd_t, key: u64, success: bool) !void {
         const status: WireMessage.Status = if (success) .success else .error_internal;
         const message = WireMessage.init(.write_response, key, 0, status);
-        
+
         const bytes_sent = try std.posix.send(socket_fd, std.mem.asBytes(&message), 0);
         if (bytes_sent != HEADER_SIZE) {
             return error.IncompleteWrite;
@@ -234,7 +234,7 @@ pub const WireProtocol = struct {
     pub fn sendDeleteResponse(socket_fd: std.posix.fd_t, key: u64, deleted: bool) !void {
         const status: WireMessage.Status = if (deleted) .success else .not_found;
         const message = WireMessage.init(.delete_response, key, 0, status);
-        
+
         const bytes_sent = try std.posix.send(socket_fd, std.mem.asBytes(&message), 0);
         if (bytes_sent != HEADER_SIZE) {
             return error.IncompleteWrite;
@@ -243,7 +243,7 @@ pub const WireProtocol = struct {
 
     pub fn sendErrorResponse(socket_fd: std.posix.fd_t, key: u64, error_status: WireMessage.Status) !void {
         const message = WireMessage.init(.error_response, key, 0, error_status);
-        
+
         const bytes_sent = try std.posix.send(socket_fd, std.mem.asBytes(&message), 0);
         if (bytes_sent != HEADER_SIZE) {
             return error.IncompleteWrite;
@@ -270,7 +270,7 @@ pub const WireProtocol = struct {
         }
 
         const message = std.mem.bytesToValue(WireMessage, &header_bytes);
-        
+
         if (message.getMessageType() != .read_response) {
             return error.UnexpectedMessageType;
         }
@@ -312,7 +312,7 @@ pub const WireProtocol = struct {
         }
 
         const message = std.mem.bytesToValue(WireMessage, &header_bytes);
-        
+
         if (message.getMessageType() != .write_response) {
             return error.UnexpectedMessageType;
         }
@@ -328,7 +328,7 @@ pub const WireProtocol = struct {
         }
 
         const message = std.mem.bytesToValue(WireMessage, &header_bytes);
-        
+
         if (message.getMessageType() != .delete_response) {
             return error.UnexpectedMessageType;
         }
@@ -342,7 +342,7 @@ pub const WireProtocol = struct {
             .sec = @intCast(timeout_ms / 1000),
             .usec = @intCast((timeout_ms % 1000) * 1000),
         };
-        
+
         try std.posix.setsockopt(socket_fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout));
         try std.posix.setsockopt(socket_fd, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&timeout));
     }

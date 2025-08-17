@@ -141,7 +141,7 @@ const CpuTopologyInfo = struct {
 
 fn getCpuTopologyInfo() ?CpuTopologyInfo {
     const builtin = @import("builtin");
-    
+
     if (builtin.cpu.arch != .x86_64) {
         return null;
     }
@@ -161,12 +161,12 @@ fn getCpuTopologyInfo() ?CpuTopologyInfo {
           [subleaf] "{ecx}" (@as(u32, 0)),
         : "memory"
     );
-    
+
     // Check if we have enough CPUID leaves
     if (eax_out < 0xB) {
         return null;
     }
-    
+
     // Get APIC ID from leaf 1
     asm volatile ("cpuid"
         : [eax] "={eax}" (eax_out),
@@ -177,9 +177,9 @@ fn getCpuTopologyInfo() ?CpuTopologyInfo {
           [subleaf] "{ecx}" (@as(u32, 0)),
         : "memory"
     );
-    
+
     const apic_id = (ebx_out >> 24) & 0xFF;
-    
+
     // Use CPUID leaf 0xB for topology
     // ECX=0 for SMT level
     asm volatile ("cpuid"
@@ -191,14 +191,14 @@ fn getCpuTopologyInfo() ?CpuTopologyInfo {
           [subleaf] "{ecx}" (@as(u32, 0)),
         : "memory"
     );
-    
+
     if ((ecx_out & 0xFF00) == 0) {
         // No topology information available
         return null;
     }
-    
+
     const logical_cpu_bits = @as(u8, @intCast(eax_out & 0x1F));
-    
+
     // ECX=1 for core level
     asm volatile ("cpuid"
         : [eax] "={eax}" (eax_out),
@@ -209,10 +209,10 @@ fn getCpuTopologyInfo() ?CpuTopologyInfo {
           [subleaf] "{ecx}" (@as(u32, 1)),
         : "memory"
     );
-    
+
     const core_and_logical_bits = @as(u8, @intCast(eax_out & 0x1F));
     const core_bits = core_and_logical_bits - logical_cpu_bits;
-    
+
     return CpuTopologyInfo{
         .logical_cpu_bits = logical_cpu_bits,
         .core_bits = core_bits,
@@ -230,7 +230,7 @@ fn isSmtSibling(apic_id: u32, logical_cpu_bits: u8) bool {
     // If logical_cpu_bits > 0, then we have SMT
     // A CPU is an SMT sibling if it's not the first logical CPU in its core
     if (logical_cpu_bits == 0) return false;
-    
+
     const logical_cpu_id = apic_id & ((@as(u32, 1) << @as(u5, @intCast(logical_cpu_bits))) - 1);
     return logical_cpu_id != 0;
 }
@@ -242,7 +242,7 @@ const CacheInfo = struct {
     cache_line_size: u32,
     shared_cpu_list: []u32,
     allocator: std.mem.Allocator,
-    
+
     pub fn deinit(self: *CacheInfo) void {
         self.allocator.free(self.shared_cpu_list);
     }
@@ -287,21 +287,21 @@ fn detectCacheLineSize() u32 {
 
 fn detectCacheInfoCpuid(allocator: std.mem.Allocator) ![]CacheInfo {
     const builtin = @import("builtin");
-    
+
     if (builtin.cpu.arch != .x86_64) {
         return &[_]CacheInfo{};
     }
-    
+
     var cache_list = std.ArrayList(CacheInfo).init(allocator);
     defer cache_list.deinit();
-    
+
     const topo_info = getCpuTopologyInfo();
-    
+
     var eax_out: u32 = undefined;
     var ebx_out: u32 = undefined;
     var ecx_out: u32 = undefined;
     var edx_out: u32 = undefined;
-    
+
     // Check CPU vendor to determine which CPUID method to use
     asm volatile ("cpuid"
         : [eax] "={eax}" (eax_out),
@@ -312,12 +312,12 @@ fn detectCacheInfoCpuid(allocator: std.mem.Allocator) ![]CacheInfo {
           [subleaf] "{ecx}" (@as(u32, 0)),
         : "memory"
     );
-    
+
     const max_std_function = eax_out;
-    
+
     // Check for AMD by looking at vendor string
     const is_amd = (ebx_out == 0x68747541) and (edx_out == 0x69746E65) and (ecx_out == 0x444D4163); // "AuthenticAMD"
-    
+
     if (is_amd) {
         // Check extended CPUID functions for AMD
         asm volatile ("cpuid"
@@ -329,9 +329,9 @@ fn detectCacheInfoCpuid(allocator: std.mem.Allocator) ![]CacheInfo {
               [subleaf] "{ecx}" (@as(u32, 0)),
             : "memory"
         );
-        
+
         const max_extended = eax_out;
-        
+
         // Use AMD CPUID 0x8000001D for newer CPUs
         if (max_extended >= 0x8000001D) {
             var cache_index: u32 = 0;
@@ -345,18 +345,18 @@ fn detectCacheInfoCpuid(allocator: std.mem.Allocator) ![]CacheInfo {
                       [subleaf] "{ecx}" (cache_index),
                     : "memory"
                 );
-                
+
                 const cache_type = eax_out & 0x1F;
                 if (cache_type == 0) break; // No more cache levels
-                
+
                 const cache_level = @as(u8, @intCast((eax_out >> 5) & 0x7));
                 const line_size = @as(u32, @intCast((ebx_out & 0xFFF) + 1));
                 const ways = @as(u32, @intCast(((ebx_out >> 22) & 0x3FF) + 1));
                 const partitions = @as(u32, @intCast(((ebx_out >> 12) & 0x3FF) + 1));
                 const sets = @as(u32, @intCast(ecx_out + 1));
-                
+
                 const cache_size = (ways * partitions * line_size * sets) / 1024; // Convert to KB
-                
+
                 // For AMD, determine CPU sharing based on cache level
                 // Get total CPU count from CPUID 0xB
                 var total_logical_cpus: u32 = 16; // fallback
@@ -365,7 +365,7 @@ fn detectCacheInfoCpuid(allocator: std.mem.Allocator) ![]CacheInfo {
                     var cpuid_ebx: u32 = undefined;
                     var cpuid_ecx: u32 = undefined;
                     var cpuid_edx: u32 = undefined;
-                    
+
                     asm volatile ("cpuid"
                         : [eax] "={eax}" (cpuid_eax),
                           [ebx] "={ebx}" (cpuid_ebx),
@@ -375,21 +375,21 @@ fn detectCacheInfoCpuid(allocator: std.mem.Allocator) ![]CacheInfo {
                           [subleaf] "{ecx}" (@as(u32, 1)),
                         : "memory"
                     );
-                    
+
                     total_logical_cpus = cpuid_ebx & 0xFFFF;
                 }
-                
+
                 const shared_cpu_count = switch (cache_level) {
                     1, 2 => if (topo_info) |info| @as(u32, 1) << @as(u5, @intCast(info.logical_cpu_bits)) else 2, // Per core
                     3 => total_logical_cpus, // Shared across all CPUs
                     else => 1,
                 };
-                
+
                 var shared_cpus = try allocator.alloc(u32, shared_cpu_count);
                 for (0..shared_cpu_count) |i| {
                     shared_cpus[i] = @as(u32, @intCast(i));
                 }
-                
+
                 try cache_list.append(CacheInfo{
                     .cache_type = @as(u8, @intCast(cache_type)),
                     .cache_level = cache_level,
@@ -414,28 +414,28 @@ fn detectCacheInfoCpuid(allocator: std.mem.Allocator) ![]CacheInfo {
                       [subleaf] "{ecx}" (cache_index),
                     : "memory"
                 );
-                
+
                 const cache_type = eax_out & 0x1F;
                 if (cache_type == 0) break; // No more cache levels
-                
+
                 const cache_level = @as(u8, @intCast((eax_out >> 5) & 0x7));
                 const line_size = @as(u32, @intCast((ebx_out & 0xFFF) + 1));
                 const ways = @as(u32, @intCast(((ebx_out >> 22) & 0x3FF) + 1));
                 const partitions = @as(u32, @intCast(((ebx_out >> 12) & 0x3FF) + 1));
                 const sets = @as(u32, @intCast(ecx_out + 1));
-                
+
                 const cache_size = (ways * partitions * line_size * sets) / 1024; // Convert to KB
-                
+
                 // Determine which CPUs share this cache
                 const shared_cores = @as(u32, @intCast(((eax_out >> 14) & 0xFFF) + 1));
                 const logical_cpus_per_core = if (topo_info) |info| @as(u32, 1) << @as(u5, @intCast(info.logical_cpu_bits)) else 1;
                 const total_logical_cpus = shared_cores * logical_cpus_per_core;
-                
+
                 var shared_cpus = try allocator.alloc(u32, total_logical_cpus);
                 for (0..total_logical_cpus) |i| {
                     shared_cpus[i] = @as(u32, @intCast(i));
                 }
-                
+
                 try cache_list.append(CacheInfo{
                     .cache_type = @as(u8, @intCast(cache_type)),
                     .cache_level = cache_level,
@@ -447,7 +447,7 @@ fn detectCacheInfoCpuid(allocator: std.mem.Allocator) ![]CacheInfo {
             }
         }
     }
-    
+
     return try cache_list.toOwnedSlice();
 }
 
@@ -459,11 +459,11 @@ pub fn analyzeCacheTopology(allocator: std.mem.Allocator) !CacheTopology {
 
     // Get CPU topology information using CPUID
     const topo_info = getCpuTopologyInfo();
-    
+
     // Determine number of logical CPUs and physical cores
     var total_logical_cpus: u32 = 1;
     var total_physical_cores: u32 = 1;
-    
+
     if (topo_info) |info| {
         // For single-package systems, just use the total count from CPUID leaf 0xB
         // Get the actual total logical CPU count from CPUID
@@ -471,7 +471,7 @@ pub fn analyzeCacheTopology(allocator: std.mem.Allocator) !CacheTopology {
         var ebx_out: u32 = undefined;
         var ecx_out: u32 = undefined;
         var edx_out: u32 = undefined;
-        
+
         // Core level (ECX=1) gives us the total logical CPU count
         asm volatile ("cpuid"
             : [eax] "={eax}" (eax_out),
@@ -482,9 +482,9 @@ pub fn analyzeCacheTopology(allocator: std.mem.Allocator) !CacheTopology {
               [subleaf] "{ecx}" (@as(u32, 1)),
             : "memory"
         );
-        
+
         total_logical_cpus = ebx_out & 0xFFFF;
-        
+
         // Calculate physical cores: total logical CPUs / threads per core
         const logical_cpus_per_core = @as(u32, 1) << @as(u5, @intCast(info.logical_cpu_bits));
         total_physical_cores = total_logical_cpus / logical_cpus_per_core;
@@ -494,7 +494,7 @@ pub fn analyzeCacheTopology(allocator: std.mem.Allocator) !CacheTopology {
         total_logical_cpus = 1;
         total_physical_cores = 1;
     }
-    
+
     // Get cache information using CPUID
     const cache_infos = detectCacheInfoCpuid(allocator) catch &[_]CacheInfo{};
     defer {
@@ -504,40 +504,40 @@ pub fn analyzeCacheTopology(allocator: std.mem.Allocator) !CacheTopology {
         }
         allocator.free(cache_infos);
     }
-    
+
     // Process L3 cache domains
     for (cache_infos) |cache_info| {
         if (cache_info.cache_level == 3 and (cache_info.cache_type == 1 or cache_info.cache_type == 3)) {
             // Create CpuCore structs with SMT detection
             var cpu_cores = try allocator.alloc(CpuCore, cache_info.shared_cpu_list.len);
-            
+
             for (cache_info.shared_cpu_list, 0..) |cpu_id, i| {
-                const physical_core_id = if (topo_info) |info| 
-                    getPhysicalCoreId(cpu_id, info.logical_cpu_bits) 
-                else 
+                const physical_core_id = if (topo_info) |info|
+                    getPhysicalCoreId(cpu_id, info.logical_cpu_bits)
+                else
                     cpu_id;
-                    
-                const is_smt = if (topo_info) |info| 
-                    isSmtSibling(cpu_id, info.logical_cpu_bits) 
-                else 
+
+                const is_smt = if (topo_info) |info|
+                    isSmtSibling(cpu_id, info.logical_cpu_bits)
+                else
                     false;
-                
+
                 cpu_cores[i] = .{
                     .cpu_id = cpu_id,
                     .is_smt_sibling = is_smt,
                     .physical_core_id = physical_core_id,
                 };
             }
-            
+
             // Create CPU list string for compatibility
             var cpu_list_str = std.ArrayList(u8).init(allocator);
             defer cpu_list_str.deinit();
-            
+
             for (cache_info.shared_cpu_list, 0..) |cpu_id, i| {
                 if (i > 0) try cpu_list_str.append(',');
                 try std.fmt.format(cpu_list_str.writer(), "{d}", .{cpu_id});
             }
-            
+
             try l3_domains.append(.{
                 .domain_id = @intCast(l3_domains.items.len),
                 .cache_size_kb = cache_info.cache_size_kb,
@@ -546,39 +546,39 @@ pub fn analyzeCacheTopology(allocator: std.mem.Allocator) !CacheTopology {
             });
         }
     }
-    
+
     // If no L3 caches found via CPUID, create a single domain with all CPUs
     if (l3_domains.items.len == 0) {
         var cpu_cores = try allocator.alloc(CpuCore, total_logical_cpus);
-        
+
         for (0..total_logical_cpus) |i| {
             const cpu_id = @as(u32, @intCast(i));
-            const physical_core_id = if (topo_info) |info| 
-                getPhysicalCoreId(cpu_id, info.logical_cpu_bits) 
-            else 
+            const physical_core_id = if (topo_info) |info|
+                getPhysicalCoreId(cpu_id, info.logical_cpu_bits)
+            else
                 cpu_id;
-                
-            const is_smt = if (topo_info) |info| 
-                isSmtSibling(cpu_id, info.logical_cpu_bits) 
-            else 
+
+            const is_smt = if (topo_info) |info|
+                isSmtSibling(cpu_id, info.logical_cpu_bits)
+            else
                 false;
-            
+
             cpu_cores[i] = .{
                 .cpu_id = cpu_id,
                 .is_smt_sibling = is_smt,
                 .physical_core_id = physical_core_id,
             };
         }
-        
+
         // Create CPU list string
         var cpu_list_str = std.ArrayList(u8).init(allocator);
         defer cpu_list_str.deinit();
-        
+
         for (0..total_logical_cpus) |i| {
             if (i > 0) try cpu_list_str.append(',');
             try std.fmt.format(cpu_list_str.writer(), "{d}", .{i});
         }
-        
+
         try l3_domains.append(.{
             .domain_id = 0,
             .cache_size_kb = 8192, // Default 8MB L3 cache assumption

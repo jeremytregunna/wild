@@ -44,7 +44,7 @@ pub const WildServer = struct {
     client_fds: std.ArrayList(std.posix.fd_t),
     read_buffers: std.ArrayList([MAX_MESSAGE_SIZE]u8),
     write_buffers: std.ArrayList([MAX_MESSAGE_SIZE]u8),
-    
+
     // Client authentication state
     client_authenticated: std.ArrayList(bool),
 
@@ -215,7 +215,7 @@ pub const WildServer = struct {
             // First message must be authentication
             return self.processAuthMessage(client_idx, message, response_buffer);
         }
-        
+
         // Client is authenticated, process normal message
         return self.processMessage(message, response_buffer);
     }
@@ -224,19 +224,19 @@ pub const WildServer = struct {
         // This should be an auth request from wire protocol
         // For simplicity, we'll parse it directly here rather than using wire_protocol
         // since the server uses a different protocol format
-        
+
         if (message.len < self.auth_secret.len) {
             response_buffer[0] = @intFromEnum(Response.err);
             return 1;
         }
-        
+
         // Compare auth secret (constant-time comparison for security)
         const received_secret = message[0..self.auth_secret.len];
         var match: u8 = 0;
         for (received_secret, self.auth_secret) |a, b| {
             match |= a ^ b;
         }
-        
+
         if (match == 0) {
             // Authentication successful
             self.client_authenticated.items[client_idx] = true;

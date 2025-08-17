@@ -48,11 +48,11 @@ fn printUsage(program_name: []const u8) void {
 
 fn parseArguments(allocator: std.mem.Allocator, args: [][:0]u8) !CommandLineArgs {
     var parsed_args = CommandLineArgs{};
-    
+
     var i: usize = 1; // Skip program name
     while (i < args.len) : (i += 1) {
         const arg = args[i];
-        
+
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             parsed_args.help = true;
         } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
@@ -110,7 +110,7 @@ fn parseArguments(allocator: std.mem.Allocator, args: [][:0]u8) !CommandLineArgs
             return error.UnknownArgument;
         }
     }
-    
+
     return parsed_args;
 }
 
@@ -131,15 +131,15 @@ fn buildDaemonConfig(args: CommandLineArgs) daemon.WildDaemon.DaemonConfig {
 
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
-    
+
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
-    
+
     if (args.len < 1) {
         printUsage("wild");
         return;
     }
-    
+
     const parsed_args = parseArguments(allocator, args) catch |err| {
         switch (err) {
             error.MissingValue => std.debug.print("Error: Missing value for argument\n", .{}),
@@ -150,20 +150,20 @@ pub fn main() !void {
         std.debug.print("Use --help for usage information\n", .{});
         std.process.exit(1);
     };
-    
+
     if (parsed_args.help) {
         printUsage(args[0]);
         return;
     }
-    
+
     if (parsed_args.version) {
         std.debug.print("WILD Database v{s}\n", .{VERSION});
         return;
     }
-    
+
     // Build daemon configuration
     const config = buildDaemonConfig(parsed_args);
-    
+
     // Validate configuration
     config.validate() catch |err| {
         switch (err) {
@@ -182,7 +182,7 @@ pub fn main() !void {
         }
         std.process.exit(1);
     };
-    
+
     // Print startup banner
     std.debug.print("🗲 WILD Database v{s} Starting Up\n", .{VERSION});
     std.debug.print("Configuration:\n", .{});
@@ -200,7 +200,7 @@ pub fn main() !void {
         std.debug.print("  Primary: {s}:{}\n", .{ config.primary_address.?, config.primary_port.? });
     }
     std.debug.print("\n", .{});
-    
+
     // Run the daemon
     try daemon.runDaemon(allocator, config);
 }

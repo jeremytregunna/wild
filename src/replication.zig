@@ -47,7 +47,7 @@ pub const ReplicaConnection = struct {
     is_connected: std.atomic.Value(bool),
     send_buffer: []u8,
     allocator: std.mem.Allocator,
-    
+
     // Bootstrap state
     is_bootstrapping: std.atomic.Value(bool),
     bootstrap_last_batch_requested: std.atomic.Value(u64),
@@ -77,7 +77,7 @@ pub const ReplicaConnection = struct {
 
         @memcpy(self.send_buffer[0..@sizeOf(ReplicationMessage)], std.mem.asBytes(&message));
         @memcpy(
-            self.send_buffer[@sizeOf(ReplicationMessage)..@sizeOf(ReplicationMessage) + @sizeOf(wal.WALBatch)],
+            self.send_buffer[@sizeOf(ReplicationMessage) .. @sizeOf(ReplicationMessage) + @sizeOf(wal.WALBatch)],
             std.mem.asBytes(batch),
         );
 
@@ -146,7 +146,7 @@ pub const PrimaryReplicator = struct {
     listen_fd: std.posix.fd_t,
     allocator: std.mem.Allocator,
     auth_secret: []const u8,
-    
+
     // Reference to database storage for snapshot creation
     database_storage: *flat_hash_storage.FlatHashStorage,
 
@@ -154,7 +154,7 @@ pub const PrimaryReplicator = struct {
     batches_replicated: std.atomic.Value(u64),
     replicas_connected: std.atomic.Value(u32),
     replication_errors: std.atomic.Value(u64),
-    
+
     // Lag detection
     last_lag_check: std.atomic.Value(i64),
 
@@ -328,10 +328,10 @@ pub const PrimaryReplicator = struct {
                 replica.is_connected.store(true, .release);
                 replica.is_bootstrapping.store(false, .release);
                 replica.bootstrap_last_batch_requested.store(0, .release);
-                
+
                 _ = self.active_replicas.fetchAdd(1, .monotonic);
                 _ = self.replicas_connected.fetchAdd(1, .monotonic);
-                
+
                 slot_found = true;
                 break;
             }
@@ -350,13 +350,13 @@ pub const PrimaryReplicator = struct {
         for (self.replica_connections) |*replica| {
             if (replica.socket_fd != -1 and
                 (!replica.is_connected.load(.acquire) or
-                (current_time - replica.last_heartbeat.load(.acquire)) > (REPLICA_TIMEOUT_MS / 1000)))
+                    (current_time - replica.last_heartbeat.load(.acquire)) > (REPLICA_TIMEOUT_MS / 1000)))
             {
                 // Clean up disconnected replica
                 std.posix.close(replica.socket_fd);
                 replica.socket_fd = -1; // Mark as unused
                 replica.is_connected.store(false, .release);
-                
+
                 _ = self.active_replicas.fetchSub(1, .monotonic);
                 _ = self.replicas_connected.fetchSub(1, .monotonic);
             }
@@ -389,7 +389,7 @@ pub const PrimaryReplicator = struct {
             if (replica.socket_fd != -1 and replica.is_connected.load(.acquire)) {
                 // Check if we need to process bootstrap requests from this replica
                 self.checkForBootstrapRequest(replica);
-                
+
                 // If replica is bootstrapping, continue sending snapshot data
                 if (replica.is_bootstrapping.load(.acquire)) {
                     self.continueBootstrapProcess(replica);
@@ -397,7 +397,7 @@ pub const PrimaryReplicator = struct {
             }
         }
     }
-    
+
     fn checkForBootstrapRequest(self: *Self, replica: *ReplicaConnection) void {
         // Check for incoming bootstrap request messages
         var temp_buffer: [64]u8 = undefined;
@@ -413,27 +413,27 @@ pub const PrimaryReplicator = struct {
                     std.debug.print("Error checking for bootstrap request: {}\n", .{err});
                     replica.is_connected.store(false, .release);
                     return;
-                }
+                },
             }
         };
-        
+
         if (bytes_available >= @sizeOf(ReplicationMessage)) {
             const message = std.mem.bytesToValue(ReplicationMessage, temp_buffer[0..@sizeOf(ReplicationMessage)]);
-            
+
             if (message.message_type == .bootstrap_request) {
                 // Actually consume the message
                 _ = std.posix.recv(replica.socket_fd, temp_buffer[0..@sizeOf(ReplicationMessage)], 0) catch return;
-                
+
                 // Start bootstrap process
                 replica.is_bootstrapping.store(true, .release);
                 replica.bootstrap_last_batch_requested.store(message.batch_id, .release);
-                
+
                 // Begin sending snapshot data
                 self.startBootstrapSnapshot(replica);
             }
         }
     }
-    
+
     fn startBootstrapSnapshot(self: *Self, replica: *ReplicaConnection) void {
         // Create and send snapshot of current database state
         const snapshot_data = self.createDatabaseSnapshot() catch {
@@ -441,16 +441,16 @@ pub const PrimaryReplicator = struct {
             return;
         };
         defer self.allocator.free(snapshot_data);
-        
+
         // Send snapshot in chunks if needed
         const chunk_size = replica.send_buffer.len - @sizeOf(ReplicationMessage);
         var offset: usize = 0;
         var sequence_id: u64 = 0;
-        
+
         while (offset < snapshot_data.len) {
             const chunk_end = @min(offset + chunk_size, snapshot_data.len);
             const chunk = snapshot_data[offset..chunk_end];
-            
+
             const message = ReplicationMessage.init(
                 .snapshot_data,
                 self.view_number.load(.acquire),
@@ -458,28 +458,28 @@ pub const PrimaryReplicator = struct {
                 0, // entry_count not used for snapshot
                 @intCast(chunk.len),
             );
-            
+
             // Send message + chunk
             @memcpy(replica.send_buffer[0..@sizeOf(ReplicationMessage)], std.mem.asBytes(&message));
-            @memcpy(replica.send_buffer[@sizeOf(ReplicationMessage)..@sizeOf(ReplicationMessage) + chunk.len], chunk);
-            
+            @memcpy(replica.send_buffer[@sizeOf(ReplicationMessage) .. @sizeOf(ReplicationMessage) + chunk.len], chunk);
+
             const total_size = @sizeOf(ReplicationMessage) + chunk.len;
             const bytes_sent = std.posix.send(replica.socket_fd, replica.send_buffer[0..total_size], 0) catch {
                 replica.is_bootstrapping.store(false, .release);
                 replica.is_connected.store(false, .release);
                 return;
             };
-            
+
             if (bytes_sent != total_size) {
                 replica.is_bootstrapping.store(false, .release);
                 replica.is_connected.store(false, .release);
                 return;
             }
-            
+
             offset = chunk_end;
             sequence_id += 1;
         }
-        
+
         // Send bootstrap complete message
         const complete_message = ReplicationMessage.init(
             .bootstrap_complete,
@@ -488,56 +488,56 @@ pub const PrimaryReplicator = struct {
             0,
             0,
         );
-        
+
         _ = std.posix.send(replica.socket_fd, std.mem.asBytes(&complete_message), 0) catch {
             replica.is_connected.store(false, .release);
             return;
         };
-        
+
         replica.is_bootstrapping.store(false, .release);
         replica.last_batch_id.store(self.wal_manager.batches_written.load(.acquire), .release);
     }
-    
+
     fn continueBootstrapProcess(self: *Self, replica: *ReplicaConnection) void {
         // For now, bootstrap is sent in one shot in startBootstrapSnapshot
         // This function could be used for more sophisticated streaming bootstrap
         _ = self;
         _ = replica;
     }
-    
+
     fn createDatabaseSnapshot(self: *Self) ![]u8 {
         // Create a snapshot of the current database state
         // We'll serialize all valid records in the flat hash storage
-        
+
         const storage_stats = self.database_storage.getStats();
         const max_records = storage_stats.total_capacity;
-        
+
         // Calculate maximum possible snapshot size
         const max_snapshot_size = max_records * @sizeOf(flat_hash_storage.CacheLineRecord);
         const snapshot_data = try self.allocator.alloc(u8, max_snapshot_size);
         var snapshot_offset: usize = 0;
-        
+
         // Iterate through all storage slots and copy valid records
         for (0..max_records) |slot_index| {
             if (self.database_storage.getRecordAtSlot(@intCast(slot_index))) |record| {
                 if (record.isValid()) {
                     const record_bytes = std.mem.asBytes(record);
-                    @memcpy(snapshot_data[snapshot_offset..snapshot_offset + record_bytes.len], record_bytes);
+                    @memcpy(snapshot_data[snapshot_offset .. snapshot_offset + record_bytes.len], record_bytes);
                     snapshot_offset += record_bytes.len;
                 }
             }
         }
-        
+
         // Resize to actual size used
         if (snapshot_offset == 0) {
             self.allocator.free(snapshot_data);
             return try self.allocator.alloc(u8, 0); // Empty snapshot
         }
-        
+
         const final_snapshot = try self.allocator.alloc(u8, snapshot_offset);
         @memcpy(final_snapshot, snapshot_data[0..snapshot_offset]);
         self.allocator.free(snapshot_data);
-        
+
         return final_snapshot;
     }
 
@@ -547,7 +547,7 @@ pub const PrimaryReplicator = struct {
             if (replica.socket_fd != -1 and replica.is_connected.load(.acquire) and !replica.is_bootstrapping.load(.acquire)) {
                 const replica_last_batch = replica.last_batch_id.load(.acquire);
                 const lag = current_batch_id - replica_last_batch;
-                
+
                 if (lag > MAX_LAG_BATCHES) {
                     // Replica is lagging too much, initiate catch-up
                     self.initiateCatchUp(replica, replica_last_batch, current_batch_id);
@@ -555,11 +555,11 @@ pub const PrimaryReplicator = struct {
             }
         }
     }
-    
+
     fn initiateCatchUp(self: *Self, replica: *ReplicaConnection, replica_batch_id: u64, current_batch_id: u64) void {
         const lag = current_batch_id - replica_batch_id;
         std.debug.print("Replica lag detected: {} batches behind, initiating catch-up\n", .{lag});
-        
+
         // For small lags, try streaming missing WAL batches first
         if (lag <= MAX_LAG_BATCHES / 4) { // Quarter of max threshold
             std.debug.print("Attempting WAL file streaming for catch-up\n", .{});
@@ -572,11 +572,11 @@ pub const PrimaryReplicator = struct {
             self.startBootstrapSnapshot(replica);
         }
     }
-    
+
     fn streamMissingBatches(self: *Self, replica: *ReplicaConnection, from_batch: u64, to_batch: u64) void {
         // Stream missing WAL batches from persistent files for efficient catch-up
         if (to_batch <= from_batch) return;
-        
+
         // Read missing batches from WAL files and stream them
         for (from_batch + 1..to_batch + 1) |batch_id| {
             if (self.readWALBatchFromDisk(@intCast(batch_id))) |batch| {
@@ -594,33 +594,33 @@ pub const PrimaryReplicator = struct {
             }
         }
     }
-    
+
     fn readWALBatchFromDisk(self: *Self, batch_id: u64) ?wal.WALBatch {
         // Read a specific WAL batch from persistent storage
         // This would integrate with the WAL file management system
-        
+
         if (self.wal_manager.wal_files.items.len == 0) return null;
-        
+
         // Search through WAL files for the requested batch
         for (self.wal_manager.wal_files.items) |*wal_file| {
             if (batch_id >= wal_file.start_batch_id and batch_id <= wal_file.end_batch_id) {
                 // Found the right file, read the batch
                 const file = std.fs.cwd().openFile(wal_file.file_path, .{}) catch return null;
                 defer file.close();
-                
+
                 // Calculate offset for this batch in the file
                 const batch_offset = (batch_id - wal_file.start_batch_id) * @sizeOf(wal.WALBatch);
                 file.seekTo(batch_offset) catch return null;
-                
+
                 var batch: wal.WALBatch = undefined;
                 const bytes_read = file.readAll(std.mem.asBytes(&batch)) catch return null;
-                
+
                 if (bytes_read == @sizeOf(wal.WALBatch) and batch.batch_id == batch_id) {
                     return batch;
                 }
             }
         }
-        
+
         return null;
     }
 
@@ -647,22 +647,22 @@ pub const PrimaryReplicator = struct {
         const current_batch_id = self.wal_manager.batches_written.load(.acquire);
         var max_lag: u64 = 0;
         var lagging_count: u32 = 0;
-        
+
         for (self.replica_connections) |*replica| {
             if (replica.socket_fd != -1 and replica.is_connected.load(.acquire)) {
                 const replica_batch = replica.last_batch_id.load(.acquire);
                 const lag = if (current_batch_id >= replica_batch) current_batch_id - replica_batch else 0;
-                
+
                 if (lag > max_lag) {
                     max_lag = lag;
                 }
-                
+
                 if (lag > MAX_LAG_BATCHES / 2) { // Consider lagging if more than half the threshold
                     lagging_count += 1;
                 }
             }
         }
-        
+
         return ReplicationStats{
             .view_number = self.view_number.load(.acquire),
             .batches_replicated = self.batches_replicated.load(.acquire),
@@ -719,29 +719,29 @@ pub const ReplicaNode = struct {
     pub fn connectToPrimary(self: *Self, primary_address: []const u8, primary_port: u16, auth_secret: []const u8) !void {
         const sock_fd = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
         const addr = try std.net.Address.parseIp(primary_address, primary_port);
-        
+
         try std.posix.connect(sock_fd, &addr.any, addr.getOsSockLen());
-        
+
         // Send authentication request to primary
         const auth_message = ReplicationMessage.init(.auth_request, 0, 0, 0, @intCast(auth_secret.len));
         _ = try std.posix.send(sock_fd, std.mem.asBytes(&auth_message), 0);
         if (auth_secret.len > 0) {
             _ = try std.posix.send(sock_fd, auth_secret, 0);
         }
-        
+
         // Receive authentication response
         var response_bytes: [@sizeOf(ReplicationMessage)]u8 = undefined;
         _ = try std.posix.recv(sock_fd, &response_bytes, 0);
         const response = std.mem.bytesToValue(ReplicationMessage, &response_bytes);
-        
+
         if (response.message_type != .auth_response or response.view_number != 0) {
             std.posix.close(sock_fd);
             return error.AuthenticationFailed;
         }
-        
+
         // Create replica connection manually since we're not using the pre-allocated pool
         const send_buffer = try self.allocator.alloc(u8, ReplicaConnection.SEND_BUFFER_SIZE);
-        
+
         self.primary_connection = ReplicaConnection{
             .socket_fd = sock_fd,
             .last_batch_id = std.atomic.Value(u64).init(0),
@@ -752,14 +752,14 @@ pub const ReplicaNode = struct {
             .is_bootstrapping = std.atomic.Value(bool).init(false),
             .bootstrap_last_batch_requested = std.atomic.Value(u64).init(0),
         };
-        
+
         // Connected to primary
     }
 
     pub fn start(self: *Self) !void {
         std.debug.assert(self.replica_thread == null);
         std.debug.assert(self.primary_connection != null);
-        
+
         self.replica_thread = try std.Thread.spawn(.{}, replicaLoop, .{self});
         // Replica started
     }
@@ -786,11 +786,7 @@ pub const ReplicaNode = struct {
                 }
 
                 // Receive data into buffer after existing data
-                const bytes_received = std.posix.recv(
-                    conn.socket_fd, 
-                    receive_buffer[buffer_used..], 
-                    0
-                ) catch {
+                const bytes_received = std.posix.recv(conn.socket_fd, receive_buffer[buffer_used..], 0) catch {
                     _ = self.connection_errors.fetchAdd(1, .monotonic);
                     conn.is_connected.store(false, .release);
                     break;
@@ -808,23 +804,20 @@ pub const ReplicaNode = struct {
                 var processed_bytes: usize = 0;
                 while (processed_bytes < buffer_used) {
                     const remaining = buffer_used - processed_bytes;
-                    
+
                     // Need at least a message header
                     if (remaining < @sizeOf(ReplicationMessage)) break;
-                    
+
                     // Parse message header
-                    const message = std.mem.bytesToValue(
-                        ReplicationMessage, 
-                        receive_buffer[processed_bytes..processed_bytes + @sizeOf(ReplicationMessage)]
-                    );
-                    
+                    const message = std.mem.bytesToValue(ReplicationMessage, receive_buffer[processed_bytes .. processed_bytes + @sizeOf(ReplicationMessage)]);
+
                     const total_message_size = @sizeOf(ReplicationMessage) + message.data_length;
-                    
+
                     // Check if we have the complete message
                     if (remaining < total_message_size) break;
-                    
+
                     // Process the complete message
-                    self.processReceivedData(receive_buffer[processed_bytes..processed_bytes + total_message_size]);
+                    self.processReceivedData(receive_buffer[processed_bytes .. processed_bytes + total_message_size]);
                     processed_bytes += total_message_size;
                 }
 
@@ -865,27 +858,27 @@ pub const ReplicaNode = struct {
     fn processSnapshotData(self: *Self, snapshot_data: []const u8, sequence_id: u64) void {
         // Process snapshot data chunks
         // For now, implement a simple approach that applies records directly
-        
+
         // Snapshot data format: sequence of CacheLineRecord structures
         var offset: usize = 0;
         while (offset + @sizeOf(flat_hash_storage.CacheLineRecord) <= snapshot_data.len) {
-            const record_bytes = snapshot_data[offset..offset + @sizeOf(flat_hash_storage.CacheLineRecord)];
+            const record_bytes = snapshot_data[offset .. offset + @sizeOf(flat_hash_storage.CacheLineRecord)];
             const record = std.mem.bytesToValue(flat_hash_storage.CacheLineRecord, record_bytes);
-            
+
             if (record.isValid()) {
                 const key = record.getKey();
                 const data = record.getData();
-                
+
                 // Apply the record to our replica database
                 self.database.write(key, data) catch {
                     _ = self.connection_errors.fetchAdd(1, .monotonic);
                     continue;
                 };
             }
-            
+
             offset += @sizeOf(flat_hash_storage.CacheLineRecord);
         }
-        
+
         // Update our sequence tracking
         _ = sequence_id; // For now, just acknowledge receipt
     }
@@ -894,13 +887,13 @@ pub const ReplicaNode = struct {
         if (data.len < @sizeOf(ReplicationMessage)) return;
 
         const message = std.mem.bytesToValue(ReplicationMessage, data[0..@sizeOf(ReplicationMessage)]);
-        
+
         // Production: no debug logging
-        
+
         // Validate message type (1=auth_request, 2=auth_response, 3=wal_batch, 4=heartbeat, 5=bootstrap_request, 6=snapshot_data, 7=bootstrap_complete)
         const raw_type = @intFromEnum(message.message_type);
         if (raw_type < 1 or raw_type > 7) return;
-        
+
         switch (message.message_type) {
             .auth_request, .auth_response => {
                 // Auth messages are handled during connection setup, ignore here
@@ -908,9 +901,9 @@ pub const ReplicaNode = struct {
             },
             .wal_batch => {
                 if (data.len < @sizeOf(ReplicationMessage) + message.data_length) return;
-                
-                const batch_data = data[@sizeOf(ReplicationMessage)..@sizeOf(ReplicationMessage) + message.data_length];
-                
+
+                const batch_data = data[@sizeOf(ReplicationMessage) .. @sizeOf(ReplicationMessage) + message.data_length];
+
                 if (batch_data.len >= @sizeOf(wal.WALBatch)) {
                     const batch = std.mem.bytesToValue(wal.WALBatch, batch_data[0..@sizeOf(wal.WALBatch)]);
                     self.applyWALBatch(&batch);
@@ -926,7 +919,7 @@ pub const ReplicaNode = struct {
             .snapshot_data => {
                 // Receive snapshot data from primary during bootstrap
                 if (data.len < @sizeOf(ReplicationMessage) + message.data_length) return;
-                const snapshot_data = data[@sizeOf(ReplicationMessage)..@sizeOf(ReplicationMessage) + message.data_length];
+                const snapshot_data = data[@sizeOf(ReplicationMessage) .. @sizeOf(ReplicationMessage) + message.data_length];
                 self.processSnapshotData(snapshot_data, message.batch_id);
             },
             .bootstrap_complete => {
@@ -943,7 +936,7 @@ pub const ReplicaNode = struct {
             if (entry.isValid()) {
                 const key = entry.getKey();
                 const data = entry.getData();
-                
+
                 // Apply the write operation to our replica
                 self.database.write(key, data) catch {
                     // On write failure, increment error counter and continue
