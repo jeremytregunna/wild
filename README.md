@@ -250,7 +250,3 @@ See our [contribution guidelines](CONTRIBUTING.md) for more information.
 - **Issues**: [GitHub Issues](https://github.com/jeremytregunna/wild/issues)
 - **Documentation**: See `docs/` directory
 - **Performance**: Run benchmarks on your hardware
-
----
-
-**WILD Database** - Extreme performance meets production reliability.

@@ -211,9 +211,10 @@ Data: (none)
 ## Protocol Constraints
 
 ### Size Limits
-- **Maximum value size**: 52 bytes (cache-line optimization)
-- **Maximum message size**: 1MB (header + data)
+- **Maximum value size**: 52 bytes (cache-line storage constraint)
+- **Maximum message size**: 1MB (designed for future batch operations)
 - **Key size**: Always 8 bytes (64-bit)
+- **Current limitation**: Single operation per message (batch support planned)
 
 ### Authentication
 - **Required**: All connections must authenticate before operations
@@ -308,6 +309,33 @@ S→C: [8, 12345, 0, 0, 0]
 - Always check status codes in responses
 - Implement exponential backoff for connection failures
 - Handle authentication failures with credential refresh
+
+---
+
+## Current Limitations and Future Enhancements
+
+### Single Operation Protocol
+The current wire protocol supports only single operations per message:
+- One key-value pair per write request
+- One key per read/delete request
+- Maximum efficiency: 52 bytes data + 24 bytes header = 76 bytes per operation
+
+### Planned Batch Operations
+WILD's core already supports efficient batch operations (`readBatch`, `writeBatch`, `deleteBatch`) with hardware-optimized sizing. Future wire protocol enhancements will add:
+
+- **Batch message types**: `batch_write_request`, `batch_read_request`, `batch_delete_request`
+- **Multi-operation payloads**: Pack thousands of operations into single 1MB messages
+- **Massive efficiency gains**: 
+  - Current: 1,000 ops = 76KB + 1,000 round trips
+  - Planned: 1,000 ops = ~60KB + 1 round trip
+
+### Performance Impact
+Batch operations would provide:
+- **25% bandwidth reduction** (packed format vs individual messages)
+- **1000× fewer round trips** (single request vs per-operation requests)  
+- **Optimal hardware utilization** using `getOptimalBatchSize()` for core-based scaling
+
+The 1MB protocol limit exists specifically to support these future batch operations while maintaining the current single-operation compatibility.
 
 ---
 
