@@ -1,17 +1,22 @@
 const std = @import("std");
 
-// Simple wire protocol for WILD database client-server communication
-// Uses binary messages for efficiency
+// Space-optimized wire protocol for WILD database client-server communication
+// Uses bit-packed header for efficient field encoding
 
 pub const WireMessage = extern struct {
-    message_type: MessageType,
-    key: u64,
-    data_length: u32,
-    status: Status,
-    reserved: u32,
-    // Variable-length data follows
+    packed_fields: u32,    // Bit-packed: message_type(4) + data_length(6) + status(3) + reserved(19)
+    key: u64,              // Database key
 
-    pub const MessageType = enum(u32) {
+    // Bit field constants
+    const MESSAGE_TYPE_MASK: u32 = 0x0000000F;
+    const MESSAGE_TYPE_SHIFT: u5 = 0;
+    const DATA_LENGTH_MASK: u32 = 0x000003F0;
+    const DATA_LENGTH_SHIFT: u5 = 4;
+    const STATUS_MASK: u32 = 0x00001C00;
+    const STATUS_SHIFT: u5 = 10;
+    const RESERVED_MASK: u32 = 0xFFFFE000;
+
+    pub const MessageType = enum(u4) {
         auth_request = 1,
         auth_response = 2,
         read_request = 3,
@@ -23,7 +28,7 @@ pub const WireMessage = extern struct {
         error_response = 9,
     };
 
-    pub const Status = enum(u32) {
+    pub const Status = enum(u3) {
         success = 0,
         not_found = 1,
         error_internal = 2,
@@ -35,20 +40,45 @@ pub const WireMessage = extern struct {
     };
 
     pub fn init(msg_type: MessageType, key: u64, data_length: u32, status: Status) WireMessage {
+        const packed_value = (@as(u32, @intFromEnum(msg_type)) << MESSAGE_TYPE_SHIFT) |
+                            (@as(u32, data_length) << DATA_LENGTH_SHIFT) |
+                            (@as(u32, @intFromEnum(status)) << STATUS_SHIFT);
+        
         return WireMessage{
-            .message_type = msg_type,
+            .packed_fields = packed_value,
             .key = key,
-            .data_length = data_length,
-            .status = status,
-            .reserved = 0,
         };
     }
+
+    pub fn getMessageType(self: *const WireMessage) MessageType {
+        const value = (self.packed_fields & MESSAGE_TYPE_MASK) >> MESSAGE_TYPE_SHIFT;
+        return @enumFromInt(value);
+    }
+
+    pub fn getDataLength(self: *const WireMessage) u32 {
+        return (self.packed_fields & DATA_LENGTH_MASK) >> DATA_LENGTH_SHIFT;
+    }
+
+    pub fn getStatus(self: *const WireMessage) Status {
+        const value = (self.packed_fields & STATUS_MASK) >> STATUS_SHIFT;
+        return @enumFromInt(value);
+    }
+
+    pub fn setStatus(self: *WireMessage, status: Status) void {
+        self.packed_fields = (self.packed_fields & ~STATUS_MASK) |
+                           (@as(u32, @intFromEnum(status)) << STATUS_SHIFT);
+    }
 };
+
+comptime {
+    std.debug.assert(@sizeOf(WireMessage) == 16);
+    std.debug.assert(@alignOf(WireMessage) <= 8);
+}
 
 pub const WireProtocol = struct {
     const Self = @This();
     const HEADER_SIZE = @sizeOf(WireMessage);
-    const MAX_DATA_SIZE = 1024 * 1024; // 1MB max payload
+    const MAX_DATA_SIZE = 52;
 
     // Authentication - first message on any connection
     pub fn sendAuthRequest(socket_fd: std.posix.fd_t, auth_secret: []const u8) !void {
@@ -93,19 +123,20 @@ pub const WireProtocol = struct {
 
         const message = std.mem.bytesToValue(WireMessage, &header_bytes);
         
-        if (message.message_type != .auth_request) {
+        if (message.getMessageType() != .auth_request) {
             return error.UnexpectedMessageType;
         }
 
-        if (message.data_length > MAX_DATA_SIZE) {
+        const data_length = message.getDataLength();
+        if (data_length > MAX_DATA_SIZE) {
             return error.DataTooLarge;
         }
 
         // Receive auth secret
-        if (message.data_length > 0) {
-            const auth_secret = try allocator.alloc(u8, message.data_length);
+        if (data_length > 0) {
+            const auth_secret = try allocator.alloc(u8, data_length);
             const data_received = try std.posix.recv(socket_fd, auth_secret, 0);
-            if (data_received != message.data_length) {
+            if (data_received != data_length) {
                 allocator.free(auth_secret);
                 return error.IncompleteRead;
             }
@@ -124,11 +155,11 @@ pub const WireProtocol = struct {
 
         const message = std.mem.bytesToValue(WireMessage, &header_bytes);
         
-        if (message.message_type != .auth_response) {
+        if (message.getMessageType() != .auth_response) {
             return error.UnexpectedMessageType;
         }
 
-        return message.status == .success;
+        return message.getStatus() == .success;
     }
 
     pub fn sendReadRequest(socket_fd: std.posix.fd_t, key: u64) !void {
@@ -240,27 +271,29 @@ pub const WireProtocol = struct {
 
         const message = std.mem.bytesToValue(WireMessage, &header_bytes);
         
-        if (message.message_type != .read_response) {
+        if (message.getMessageType() != .read_response) {
             return error.UnexpectedMessageType;
         }
 
-        if (message.status == .not_found) {
+        const status = message.getStatus();
+        if (status == .not_found) {
             return ReadResult{ .data = null, .allocator = allocator };
         }
 
-        if (message.status != .success) {
+        if (status != .success) {
             return error.ServerError;
         }
 
         // Receive data if any
-        if (message.data_length > 0) {
-            if (message.data_length > MAX_DATA_SIZE) {
+        const data_length = message.getDataLength();
+        if (data_length > 0) {
+            if (data_length > MAX_DATA_SIZE) {
                 return error.DataTooLarge;
             }
 
-            const data = try allocator.alloc(u8, message.data_length);
+            const data = try allocator.alloc(u8, data_length);
             const data_received = try std.posix.recv(socket_fd, data, 0);
-            if (data_received != message.data_length) {
+            if (data_received != data_length) {
                 allocator.free(data);
                 return error.IncompleteRead;
             }
@@ -280,11 +313,11 @@ pub const WireProtocol = struct {
 
         const message = std.mem.bytesToValue(WireMessage, &header_bytes);
         
-        if (message.message_type != .write_response) {
+        if (message.getMessageType() != .write_response) {
             return error.UnexpectedMessageType;
         }
 
-        return message.status == .success;
+        return message.getStatus() == .success;
     }
 
     pub fn receiveDeleteResponse(socket_fd: std.posix.fd_t) !bool {
@@ -296,11 +329,11 @@ pub const WireProtocol = struct {
 
         const message = std.mem.bytesToValue(WireMessage, &header_bytes);
         
-        if (message.message_type != .delete_response) {
+        if (message.getMessageType() != .delete_response) {
             return error.UnexpectedMessageType;
         }
 
-        return message.status == .success;
+        return message.getStatus() == .success;
     }
 
     // Timeout utilities for non-blocking operations
