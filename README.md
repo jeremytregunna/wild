@@ -8,7 +8,7 @@ WILD (Within-cache Incredibly Lightweight Database) is a production-ready high-p
 [![Security](https://img.shields.io/badge/Security-Authenticated-blue)](docs/SECURITY.md)
 [![Replication](https://img.shields.io/badge/Replication-Primary%2FReplica-orange)](docs/REPLICATION.md)
 
-## 🚀 Quick Start
+## Quick Start
 
 ```bash
 # 1. Build WILD
@@ -21,7 +21,7 @@ zig build
 ./zig-out/bin/wild-client-example health
 ```
 
-## 📊 Performance Characteristics
+## Performance Characteristics
 
 ### Benchmark Results (Ryzen 9 7800X3D, 96MB L3 Cache)
 
@@ -36,7 +36,7 @@ zig build
 - **620M+ ops/sec** total throughput
 - **Cache-optimized storage** sized to fit entirely in L3 cache
 
-## 🏗️ Architecture
+## Architecture
 
 WILD leverages modern CPU architecture for extreme performance:
 
@@ -51,7 +51,7 @@ WILD leverages modern CPU architecture for extreme performance:
 - **Snapshots**: Point-in-time recovery system
 - **High Concurrency**: 100,000+ concurrent connections via io_uring (requires Linux)
 
-## 🔐 Security & Authentication
+## Security & Authentication
 
 WILD includes a simple authentication system:
 
@@ -64,14 +64,14 @@ WILD includes a simple authentication system:
 ```
 
 **Security Features:**
-- ✅ Shared secret authentication for all connections
-- ✅ Timing-attack resistant constant-time comparison
-- ✅ Replication authentication (primary-replica security)
-- ✅ Connection-level access control
+- Shared secret authentication for all connections
+- Timing-attack resistant
+- Replication authentication
+- Connection-level access control
 
 See [docs/SECURITY.md](docs/SECURITY.md) for detailed security information.
 
-## 🔄 Replication & High Availability
+## Replication & High Availability
 
 WILD supports primary-replica replication for read scaling:
 
@@ -97,14 +97,13 @@ WILD supports primary-replica replication for read scaling:
 ```
 
 **Replication Features:**
-- 📈 **Read Scaling**: Distribute read load across replicas
-- 🔒 **Authenticated Replication**: Secure primary-replica communication
-- ⚡ **Real-time Sync**: WAL-based replication with minimal lag
-- 🎯 **Automatic Failover**: Client-side replica health monitoring
+- **Read Scaling**: Distribute read load across replicas
+- **Real-time Sync**: WAL-based replication with minimal lag
+- **Automatic Failover**: Client-side replica health monitoring
 
 See [docs/REPLICATION.md](docs/REPLICATION.md) for replication setup and management.
 
-## 📋 Usage Examples
+## Usage Examples
 
 ### Standalone Database
 ```bash
@@ -157,8 +156,10 @@ See [docs/REPLICATION.md](docs/REPLICATION.md) for replication setup and managem
 
 ### Prerequisites
 - Zig 0.14+
-- Linux x86-64 (other platforms untested)
+- Linux x86-64 (other platforms unsupported, PRs welcome)
 - CPU with L3 cache (more cache = higher capacity)
+  - Storage space sizing is based on 75% of available L3 cache, divided by one cache line (64 bytes) then rounded down to the largest power of two that fits.
+    - e.g., 96MB L3 cache means 72MB / 64 bytes = 1,179,648 records; rounded down to power of 2 is 1,048,576 records (2^20). Means space occupied in memory for data is 64MB.
 
 ### Building
 ```bash
@@ -186,41 +187,40 @@ zig run replication_test.zig -O ReleaseFast
 zig run recovery_benchmark.zig -O ReleaseFast
 ```
 
-## 📚 Documentation
+## Documentation
 
 | Document | Description |
 |----------|-------------|
 | [docs/WIRE_PROTOCOL.md](docs/WIRE_PROTOCOL.md) | Binary protocol specification |
 | [docs/REPLICATION.md](docs/REPLICATION.md) | Replication setup and management |
 | [docs/SECURITY.md](docs/SECURITY.md) | Authentication and security features |
-| [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | Performance tuning and benchmarks |
-| [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | Production deployment guide |
 | [docs/API.md](docs/API.md) | Client API reference |
 
-## 🎯 Use Cases
+## Use Cases
 
 WILD is optimized for specific high-performance scenarios:
 
-### ✅ Perfect For
+### Perfect For
 - **Cache-like workloads**: Session stores, temporary data
 - **Read-heavy applications**: Content delivery, catalog data
 - **Ultra-low latency**: Trading systems, real-time analytics
 - **High-throughput services**: Ad serving, recommendation engines
+- **Small datasets**: You're limited to 52 bytes of data for the data you store in each record
 
-### ❌ Not Suitable For
+### Not Suitable For
 - **Large datasets**: Must fit entirely in L3 cache
 - **Complex queries**: Key-value operations only
-- **ACID transactions**: Single-operation consistency only
-- **Cross-platform**: Linux x86-64 primarily supported
+- **ACID transactions**: Single-operation/batch consistency only
+- **Cross-platform**: Linux x86-64 supported
 
-## 📈 Performance Tuning
+## Performance Tuning
 
 ### Capacity Planning
 ```bash
 # Check L3 cache size
 ./zig-out/bin/wild --help  # Shows detected cache size
 
-# Set capacity (records must fit in L3 cache)
+# Set capacity
 ./zig-out/bin/wild --capacity 500000  # ~32MB for 500k records
 ```
 
@@ -230,23 +230,26 @@ WILD is optimized for specific high-performance scenarios:
 - **CPU**: Higher core count improves concurrent throughput
 - **Storage**: NVMe SSD recommended for WAL files
 
-## ⚖️ License
+## License
 
 MIT License - see [LICENSE](LICENSE) for details.
 
-## 🤝 Contributing
+## Contributing
 
+Contributions are welcome! Please feel free to submit a Pull Request.
 1. Fork the repository
-2. Create a feature branch
-3. Run tests: `zig build test`
-4. Submit a pull request
+2. Create your feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add some amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
 
-## 📞 Support
+See our [contribution guidelines](CONTRIBUTING.md) for more information.
 
-- **Issues**: [GitHub Issues](https://github.com/your-repo/wild/issues)
+## Support
+
+- **Issues**: [GitHub Issues](https://github.com/jeremytregunna/wild/issues)
 - **Documentation**: See `docs/` directory
 - **Performance**: Run benchmarks on your hardware
-- **Security**: Report security issues privately
 
 ---
 
