@@ -34,6 +34,9 @@ pub const WildDaemon = struct {
         primary_address: ?[]const u8, // For replica mode
         primary_port: ?u16, // For replica mode
         
+        // Authentication
+        auth_secret: ?[]const u8,
+        
         pub const ReplicationMode = enum {
             none,      // No replication
             primary,   // Act as primary (accept replica connections)
@@ -51,6 +54,7 @@ pub const WildDaemon = struct {
                 .replication_port = null,
                 .primary_address = null,
                 .primary_port = null,
+                .auth_secret = null,
             };
         }
         
@@ -138,16 +142,25 @@ pub const WildDaemon = struct {
                 if (!self.config.enable_wal) {
                     return error.WALRequiredForReplication;
                 }
-                try database.enableReplicationAsPrimary(self.config.replication_port.?);
+                const auth_secret = self.config.auth_secret orelse {
+                    std.debug.print("Error: --auth-secret is required for replication mode\n", .{});
+                    return error.AuthSecretRequired;
+                };
+                try database.enableReplicationAsPrimary(self.config.replication_port.?, auth_secret);
                 std.debug.print("WILD daemon started as PRIMARY on replication port {}\n", .{self.config.replication_port.?});
             },
             .replica => {
                 if (!self.config.enable_wal) {
                     return error.WALRequiredForReplication;
                 }
+                const auth_secret = self.config.auth_secret orelse {
+                    std.debug.print("Error: --auth-secret is required for replication mode\n", .{});
+                    return error.AuthSecretRequired;
+                };
                 try database.enableReplicationAsReplica(
                     self.config.primary_address.?,
-                    self.config.primary_port.?
+                    self.config.primary_port.?,
+                    auth_secret
                 );
                 std.debug.print("WILD daemon started as REPLICA connecting to {s}:{}\n", .{ 
                     self.config.primary_address.?, 

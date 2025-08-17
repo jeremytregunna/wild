@@ -18,11 +18,13 @@ pub const ReplicationMessage = extern struct {
     // Variable-length data follows
 
     pub const MessageType = enum(u32) {
-        wal_batch = 1,
-        heartbeat = 2,
-        bootstrap_request = 3,
-        snapshot_data = 4,
-        bootstrap_complete = 5,
+        auth_request = 1,
+        auth_response = 2,
+        wal_batch = 3,
+        heartbeat = 4,
+        bootstrap_request = 5,
+        snapshot_data = 6,
+        bootstrap_complete = 7,
     };
 
     pub fn init(msg_type: MessageType, view_number: u64, batch_id: u64, entry_count: u16, data_length: u32) ReplicationMessage {
@@ -143,6 +145,7 @@ pub const PrimaryReplicator = struct {
     wal_manager: *wal.DurabilityManager,
     listen_fd: std.posix.fd_t,
     allocator: std.mem.Allocator,
+    auth_secret: []const u8,
     
     // Reference to database storage for snapshot creation
     database_storage: *flat_hash_storage.FlatHashStorage,
@@ -162,7 +165,7 @@ pub const PrimaryReplicator = struct {
     const LAG_CHECK_INTERVAL_MS = 10000; // 10 seconds
     const MAX_LAG_BATCHES = 100; // Maximum batches a replica can lag behind
 
-    pub fn init(allocator: std.mem.Allocator, wal_manager: *wal.DurabilityManager, database_storage: *flat_hash_storage.FlatHashStorage, listen_port: u16) !Self {
+    pub fn init(allocator: std.mem.Allocator, wal_manager: *wal.DurabilityManager, database_storage: *flat_hash_storage.FlatHashStorage, listen_port: u16, auth_secret: []const u8) !Self {
         // Create listening socket for replica connections
         const listen_fd = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
         try std.posix.setsockopt(listen_fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
@@ -204,6 +207,7 @@ pub const PrimaryReplicator = struct {
             .wal_manager = wal_manager,
             .listen_fd = listen_fd,
             .allocator = allocator,
+            .auth_secret = auth_secret,
             .database_storage = database_storage,
             .batches_replicated = std.atomic.Value(u64).init(0),
             .replicas_connected = std.atomic.Value(u32).init(0),
@@ -712,11 +716,28 @@ pub const ReplicaNode = struct {
         }
     }
 
-    pub fn connectToPrimary(self: *Self, primary_address: []const u8, primary_port: u16) !void {
+    pub fn connectToPrimary(self: *Self, primary_address: []const u8, primary_port: u16, auth_secret: []const u8) !void {
         const sock_fd = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
         const addr = try std.net.Address.parseIp(primary_address, primary_port);
         
         try std.posix.connect(sock_fd, &addr.any, addr.getOsSockLen());
+        
+        // Send authentication request to primary
+        const auth_message = ReplicationMessage.init(.auth_request, 0, 0, 0, @intCast(auth_secret.len));
+        _ = try std.posix.send(sock_fd, std.mem.asBytes(&auth_message), 0);
+        if (auth_secret.len > 0) {
+            _ = try std.posix.send(sock_fd, auth_secret, 0);
+        }
+        
+        // Receive authentication response
+        var response_bytes: [@sizeOf(ReplicationMessage)]u8 = undefined;
+        _ = try std.posix.recv(sock_fd, &response_bytes, 0);
+        const response = std.mem.bytesToValue(ReplicationMessage, &response_bytes);
+        
+        if (response.message_type != .auth_response or response.view_number != 0) {
+            std.posix.close(sock_fd);
+            return error.AuthenticationFailed;
+        }
         
         // Create replica connection manually since we're not using the pre-allocated pool
         const send_buffer = try self.allocator.alloc(u8, ReplicaConnection.SEND_BUFFER_SIZE);
@@ -876,11 +897,15 @@ pub const ReplicaNode = struct {
         
         // Production: no debug logging
         
-        // Validate message type (1=wal_batch, 2=heartbeat, 3=bootstrap_request, 4=snapshot_data, 5=bootstrap_complete)
+        // Validate message type (1=auth_request, 2=auth_response, 3=wal_batch, 4=heartbeat, 5=bootstrap_request, 6=snapshot_data, 7=bootstrap_complete)
         const raw_type = @intFromEnum(message.message_type);
-        if (raw_type < 1 or raw_type > 5) return;
+        if (raw_type < 1 or raw_type > 7) return;
         
         switch (message.message_type) {
+            .auth_request, .auth_response => {
+                // Auth messages are handled during connection setup, ignore here
+                return;
+            },
             .wal_batch => {
                 if (data.len < @sizeOf(ReplicationMessage) + message.data_length) return;
                 

@@ -207,11 +207,14 @@ pub const FlatHashStorage = struct {
         // Critical path: update cache line (maintains 42ns performance)
         self.records[pos] = try CacheLineRecord.init(key, data);
 
-        // Always-async durability: never blocks
+        // PERFORMANCE DESIGN CHOICE: Always-async durability never blocks write path
+        // This prioritizes consistent 42ns write latency over guaranteed durability
         if (self.durability_manager) |dur_mgr| {
             _ = dur_mgr.appendAsync(&self.records[pos]);
-            // Note: We ignore the return value to never block
-            // If WAL ring is full, the entry is dropped but write succeeds
+            // INTENTIONAL: Ignore return value to maintain lock-free performance
+            // Trade-off: WAL ring full = dropped entry, but write still succeeds
+            // Rationale: Better to lose some durability than block all writes
+            // Alternative: Use blocking WAL for critical data, async for cache-like workloads
         }
 
         // Update count only for new insertions

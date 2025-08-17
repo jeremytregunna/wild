@@ -38,42 +38,52 @@ pub const WildServer = struct {
     static_alloc: *static_allocator.StaticAllocator,
     bind_address: []const u8,
     port: u16,
+    auth_secret: []const u8,
 
     // Pre-allocated buffers
     client_fds: std.ArrayList(std.posix.fd_t),
     read_buffers: std.ArrayList([MAX_MESSAGE_SIZE]u8),
     write_buffers: std.ArrayList([MAX_MESSAGE_SIZE]u8),
+    
+    // Client authentication state
+    client_authenticated: std.ArrayList(bool),
 
-    pub fn init(database: *wild.WILD, static_alloc: *static_allocator.StaticAllocator, bind_address: []const u8, port: u16) !Self {
+    pub fn init(database: *wild.WILD, static_alloc: *static_allocator.StaticAllocator, bind_address: []const u8, port: u16, auth_secret: []const u8) !Self {
         const MAX_CLIENTS = 100000; // Support massive concurrent connections
 
         var client_fds = std.ArrayList(std.posix.fd_t).init(static_alloc.allocator());
         var read_buffers = std.ArrayList([MAX_MESSAGE_SIZE]u8).init(static_alloc.allocator());
         var write_buffers = std.ArrayList([MAX_MESSAGE_SIZE]u8).init(static_alloc.allocator());
+        var client_authenticated = std.ArrayList(bool).init(static_alloc.allocator());
 
         // Pre-allocate all the memory we'll need before static allocator freezes
         try client_fds.ensureTotalCapacity(MAX_CLIENTS);
         try read_buffers.ensureTotalCapacity(MAX_CLIENTS);
         try write_buffers.ensureTotalCapacity(MAX_CLIENTS);
+        try client_authenticated.ensureTotalCapacity(MAX_CLIENTS);
 
         // Pre-allocate the actual buffer storage
         for (0..MAX_CLIENTS) |_| {
             try read_buffers.append(std.mem.zeroes([MAX_MESSAGE_SIZE]u8));
             try write_buffers.append(std.mem.zeroes([MAX_MESSAGE_SIZE]u8));
+            try client_authenticated.append(false);
         }
 
         // Clear the arrays but keep capacity
         read_buffers.clearRetainingCapacity();
         write_buffers.clearRetainingCapacity();
+        client_authenticated.clearRetainingCapacity();
 
         return Self{
             .database = database,
             .static_alloc = static_alloc,
             .bind_address = bind_address,
             .port = port,
+            .auth_secret = auth_secret,
             .client_fds = client_fds,
             .read_buffers = read_buffers,
             .write_buffers = write_buffers,
+            .client_authenticated = client_authenticated,
         };
     }
 
@@ -123,6 +133,7 @@ pub const WildServer = struct {
                             try self.client_fds.append(client_fd);
                             try self.read_buffers.append(undefined);
                             try self.write_buffers.append(undefined);
+                            try self.client_authenticated.append(false); // Start unauthenticated
 
                             const client_idx = self.client_fds.items.len - 1;
 
@@ -158,18 +169,20 @@ pub const WildServer = struct {
                             self.client_fds.items[client_idx] = self.client_fds.items[last_idx];
                             self.read_buffers.items[client_idx] = self.read_buffers.items[last_idx];
                             self.write_buffers.items[client_idx] = self.write_buffers.items[last_idx];
+                            self.client_authenticated.items[client_idx] = self.client_authenticated.items[last_idx];
                         }
                         _ = self.client_fds.pop();
                         _ = self.read_buffers.pop();
                         _ = self.write_buffers.pop();
+                        _ = self.client_authenticated.pop();
                         continue;
                     }
 
-                    // Process message
+                    // Process message with authentication check
                     const bytes_read = @as(usize, @intCast(cqe.res));
                     const message = self.read_buffers.items[client_idx][0..bytes_read];
 
-                    const response_len = self.processMessage(message, &self.write_buffers.items[client_idx]) catch {
+                    const response_len = self.processMessageWithAuth(client_idx, message, &self.write_buffers.items[client_idx]) catch {
                         // Error processing, send error response
                         self.write_buffers.items[client_idx][0] = @intFromEnum(Response.err);
                         const error_write_sqe = try ring.get_sqe();
@@ -193,6 +206,46 @@ pub const WildServer = struct {
             if (cq_count == 0) {
                 std.time.sleep(1000); // 1μs
             }
+        }
+    }
+
+    fn processMessageWithAuth(self: *Self, client_idx: usize, message: []const u8, response_buffer: []u8) !usize {
+        // Check if client is authenticated for non-auth messages
+        if (!self.client_authenticated.items[client_idx]) {
+            // First message must be authentication
+            return self.processAuthMessage(client_idx, message, response_buffer);
+        }
+        
+        // Client is authenticated, process normal message
+        return self.processMessage(message, response_buffer);
+    }
+
+    fn processAuthMessage(self: *Self, client_idx: usize, message: []const u8, response_buffer: []u8) !usize {
+        // This should be an auth request from wire protocol
+        // For simplicity, we'll parse it directly here rather than using wire_protocol
+        // since the server uses a different protocol format
+        
+        if (message.len < self.auth_secret.len) {
+            response_buffer[0] = @intFromEnum(Response.err);
+            return 1;
+        }
+        
+        // Compare auth secret (constant-time comparison for security)
+        const received_secret = message[0..self.auth_secret.len];
+        var match: u8 = 0;
+        for (received_secret, self.auth_secret) |a, b| {
+            match |= a ^ b;
+        }
+        
+        if (match == 0) {
+            // Authentication successful
+            self.client_authenticated.items[client_idx] = true;
+            response_buffer[0] = @intFromEnum(Response.ok);
+            return 1;
+        } else {
+            // Authentication failed
+            response_buffer[0] = @intFromEnum(Response.err);
+            return 1;
         }
     }
 

@@ -10,6 +10,7 @@ pub const ClientRouter = struct {
     replica_endpoints: []Endpoint,
     active_replicas: std.ArrayList(u32),
     next_replica_index: std.atomic.Value(u32),
+    auth_secret: []const u8,
     
     // Connection pools
     primary_pool: ConnectionPool,
@@ -59,7 +60,7 @@ pub const ClientRouter = struct {
             self.connections.deinit();
         }
         
-        pub fn getConnection(self: *ConnectionPool, endpoint: *const Endpoint) !std.posix.fd_t {
+        pub fn getConnection(self: *ConnectionPool, endpoint: *const Endpoint, auth_secret: []const u8) !std.posix.fd_t {
             // Try to reuse existing connection
             for (self.connections.items) |*conn| {
                 if (conn.is_connected.load(.acquire)) {
@@ -70,7 +71,7 @@ pub const ClientRouter = struct {
             
             // Create new connection if under limit
             if (self.active_connections.load(.acquire) < self.max_connections) {
-                const socket_fd = try self.createConnection(endpoint);
+                const socket_fd = try self.createConnection(endpoint, auth_secret);
                 
                 try self.connections.append(Connection{
                     .socket_fd = socket_fd,
@@ -85,11 +86,21 @@ pub const ClientRouter = struct {
             return error.PoolExhausted;
         }
         
-        fn createConnection(self: *ConnectionPool, endpoint: *const Endpoint) !std.posix.fd_t {
+        fn createConnection(self: *ConnectionPool, endpoint: *const Endpoint, auth_secret: []const u8) !std.posix.fd_t {
             _ = self;
             const socket_fd = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+            errdefer std.posix.close(socket_fd);
+            
             const addr = try std.net.Address.parseIp(endpoint.address, endpoint.port);
             try std.posix.connect(socket_fd, &addr.any, addr.getOsSockLen());
+            
+            // Authenticate with server
+            try wire_protocol.WireProtocol.sendAuthRequest(socket_fd, auth_secret);
+            const auth_success = try wire_protocol.WireProtocol.receiveAuthResponse(socket_fd);
+            if (!auth_success) {
+                return error.AuthenticationFailed;
+            }
+            
             return socket_fd;
         }
         
@@ -104,10 +115,13 @@ pub const ClientRouter = struct {
         
         pub fn closeConnection(self: *ConnectionPool, socket_fd: std.posix.fd_t) void {
             for (self.connections.items) |*conn| {
-                if (conn.socket_fd == socket_fd and conn.is_connected.load(.acquire)) {
-                    std.posix.close(socket_fd);
-                    conn.is_connected.store(false, .release);
-                    _ = self.active_connections.fetchSub(1, .monotonic);
+                if (conn.socket_fd == socket_fd) {
+                    // Use CAS to atomically transition from connected to disconnected
+                    // Only the first thread to successfully CAS will close the socket
+                    if (conn.is_connected.cmpxchgWeak(true, false, .acq_rel, .acquire) == null) {
+                        std.posix.close(socket_fd);
+                        _ = self.active_connections.fetchSub(1, .release);
+                    }
                     break;
                 }
             }
@@ -119,6 +133,7 @@ pub const ClientRouter = struct {
         primary_port: u16,
         replica_addresses: []const []const u8,
         replica_ports: []const u16,
+        auth_secret: []const u8,
         max_connections_per_endpoint: u32 = 10,
         health_check_interval_ms: u32 = 30000, // 30 seconds
     };
@@ -166,6 +181,7 @@ pub const ClientRouter = struct {
             .replica_endpoints = replica_endpoints,
             .active_replicas = active_replicas,
             .next_replica_index = std.atomic.Value(u32).init(0),
+            .auth_secret = config.auth_secret,
             .primary_pool = primary_pool,
             .replica_pools = replica_pools,
             .health_check_interval_ms = config.health_check_interval_ms,
@@ -238,7 +254,7 @@ pub const ClientRouter = struct {
         if (!endpoint.is_healthy.load(.acquire)) return null;
         
         const pool = &self.replica_pools[replica_index];
-        const socket_fd = pool.getConnection(endpoint) catch {
+        const socket_fd = pool.getConnection(endpoint, self.auth_secret) catch {
             self.markEndpointUnhealthy(endpoint);
             return null;
         };
@@ -271,7 +287,7 @@ pub const ClientRouter = struct {
             return error.PrimaryUnhealthy;
         }
         
-        const socket_fd = self.primary_pool.getConnection(endpoint) catch |err| {
+        const socket_fd = self.primary_pool.getConnection(endpoint, self.auth_secret) catch |err| {
             self.markEndpointUnhealthy(endpoint);
             return err;
         };
@@ -301,7 +317,7 @@ pub const ClientRouter = struct {
             return error.PrimaryUnhealthy;
         }
         
-        const socket_fd = self.primary_pool.getConnection(endpoint) catch |err| {
+        const socket_fd = self.primary_pool.getConnection(endpoint, self.auth_secret) catch |err| {
             switch (err) {
                 error.ConnectionRefused, error.NetworkUnreachable => {
                     self.markEndpointUnhealthy(endpoint);
@@ -342,7 +358,7 @@ pub const ClientRouter = struct {
             return error.PrimaryUnhealthy;
         }
         
-        const socket_fd = self.primary_pool.getConnection(endpoint) catch |err| {
+        const socket_fd = self.primary_pool.getConnection(endpoint, self.auth_secret) catch |err| {
             self.markEndpointUnhealthy(endpoint);
             return err;
         };
@@ -432,15 +448,16 @@ pub const ClientRouter = struct {
         var healthy_replicas: u32 = 0;
         var total_failures: u32 = 0;
         
+        // Use relaxed ordering for statistics collection - no synchronization needed
         for (self.replica_endpoints) |*endpoint| {
-            if (endpoint.is_healthy.load(.acquire)) {
+            if (endpoint.is_healthy.load(.monotonic)) {
                 healthy_replicas += 1;
             }
-            total_failures += endpoint.consecutive_failures.load(.acquire);
+            total_failures += endpoint.consecutive_failures.load(.monotonic);
         }
         
         return RouterStats{
-            .primary_healthy = self.primary_endpoint.is_healthy.load(.acquire),
+            .primary_healthy = self.primary_endpoint.is_healthy.load(.monotonic),
             .healthy_replicas = healthy_replicas,
             .total_replicas = @intCast(self.replica_endpoints.len),
             .total_failures = total_failures,
@@ -449,9 +466,10 @@ pub const ClientRouter = struct {
     }
     
     fn countActiveConnections(self: *const Self) u32 {
-        var total: u32 = self.primary_pool.active_connections.load(.acquire);
+        // Use relaxed ordering for statistics - no synchronization needed
+        var total: u32 = self.primary_pool.active_connections.load(.monotonic);
         for (self.replica_pools) |*pool| {
-            total += pool.active_connections.load(.acquire);
+            total += pool.active_connections.load(.monotonic);
         }
         return total;
     }

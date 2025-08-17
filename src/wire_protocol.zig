@@ -12,13 +12,15 @@ pub const WireMessage = extern struct {
     // Variable-length data follows
 
     pub const MessageType = enum(u32) {
-        read_request = 1,
-        read_response = 2,
-        write_request = 3,
-        write_response = 4,
-        delete_request = 5,
-        delete_response = 6,
-        error_response = 7,
+        auth_request = 1,
+        auth_response = 2,
+        read_request = 3,
+        read_response = 4,
+        write_request = 5,
+        write_response = 6,
+        delete_request = 7,
+        delete_response = 8,
+        error_response = 9,
     };
 
     pub const Status = enum(u32) {
@@ -28,6 +30,8 @@ pub const WireMessage = extern struct {
         error_invalid_key = 3,
         error_data_too_large = 4,
         error_connection = 5,
+        error_auth_required = 6,
+        error_auth_failed = 7,
     };
 
     pub fn init(msg_type: MessageType, key: u64, data_length: u32, status: Status) WireMessage {
@@ -45,6 +49,87 @@ pub const WireProtocol = struct {
     const Self = @This();
     const HEADER_SIZE = @sizeOf(WireMessage);
     const MAX_DATA_SIZE = 1024 * 1024; // 1MB max payload
+
+    // Authentication - first message on any connection
+    pub fn sendAuthRequest(socket_fd: std.posix.fd_t, auth_secret: []const u8) !void {
+        if (auth_secret.len > MAX_DATA_SIZE) {
+            return error.DataTooLarge;
+        }
+
+        const message = WireMessage.init(.auth_request, 0, @intCast(auth_secret.len), .success);
+        
+        // Send header
+        var bytes_sent = try std.posix.send(socket_fd, std.mem.asBytes(&message), 0);
+        if (bytes_sent != HEADER_SIZE) {
+            return error.IncompleteWrite;
+        }
+
+        // Send auth secret
+        if (auth_secret.len > 0) {
+            bytes_sent = try std.posix.send(socket_fd, auth_secret, 0);
+            if (bytes_sent != auth_secret.len) {
+                return error.IncompleteWrite;
+            }
+        }
+    }
+
+    pub fn sendAuthResponse(socket_fd: std.posix.fd_t, success: bool) !void {
+        const status: WireMessage.Status = if (success) .success else .error_auth_failed;
+        const message = WireMessage.init(.auth_response, 0, 0, status);
+        
+        const bytes_sent = try std.posix.send(socket_fd, std.mem.asBytes(&message), 0);
+        if (bytes_sent != HEADER_SIZE) {
+            return error.IncompleteWrite;
+        }
+    }
+
+    pub fn receiveAuthRequest(socket_fd: std.posix.fd_t, allocator: std.mem.Allocator) ![]u8 {
+        // Receive header
+        var header_bytes: [HEADER_SIZE]u8 = undefined;
+        const header_received = try std.posix.recv(socket_fd, &header_bytes, 0);
+        if (header_received != HEADER_SIZE) {
+            return error.IncompleteRead;
+        }
+
+        const message = std.mem.bytesToValue(WireMessage, &header_bytes);
+        
+        if (message.message_type != .auth_request) {
+            return error.UnexpectedMessageType;
+        }
+
+        if (message.data_length > MAX_DATA_SIZE) {
+            return error.DataTooLarge;
+        }
+
+        // Receive auth secret
+        if (message.data_length > 0) {
+            const auth_secret = try allocator.alloc(u8, message.data_length);
+            const data_received = try std.posix.recv(socket_fd, auth_secret, 0);
+            if (data_received != message.data_length) {
+                allocator.free(auth_secret);
+                return error.IncompleteRead;
+            }
+            return auth_secret;
+        } else {
+            return allocator.alloc(u8, 0); // Empty secret
+        }
+    }
+
+    pub fn receiveAuthResponse(socket_fd: std.posix.fd_t) !bool {
+        var header_bytes: [HEADER_SIZE]u8 = undefined;
+        const header_received = try std.posix.recv(socket_fd, &header_bytes, 0);
+        if (header_received != HEADER_SIZE) {
+            return error.IncompleteRead;
+        }
+
+        const message = std.mem.bytesToValue(WireMessage, &header_bytes);
+        
+        if (message.message_type != .auth_response) {
+            return error.UnexpectedMessageType;
+        }
+
+        return message.status == .success;
+    }
 
     pub fn sendReadRequest(socket_fd: std.posix.fd_t, key: u64) !void {
         const message = WireMessage.init(.read_request, key, 0, .success);

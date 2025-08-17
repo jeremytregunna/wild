@@ -16,6 +16,7 @@ const CommandLineArgs = struct {
     replication_port: ?u16 = null,
     primary_address: ?[]const u8 = null,
     primary_port: ?u16 = null,
+    auth_secret: ?[]const u8 = null,
     help: bool = false,
     version: bool = false,
 };
@@ -33,15 +34,16 @@ fn printUsage(program_name: []const u8) void {
     std.debug.print("  --replication-port PORT  Port for replica connections (primary mode)\n", .{});
     std.debug.print("  --primary-address ADDR   Primary server address (replica mode)\n", .{});
     std.debug.print("  --primary-port PORT      Primary server port (replica mode)\n", .{});
+    std.debug.print("  --auth-secret SECRET     Shared authentication secret (required for connections)\n", .{});
     std.debug.print("  --help, -h               Show this help message\n", .{});
     std.debug.print("  --version, -v            Show version information\n", .{});
     std.debug.print("\nExamples:\n", .{});
     std.debug.print("  # Standalone database without replication\n", .{});
     std.debug.print("  {s} --capacity 1000000\n\n", .{program_name});
     std.debug.print("  # Primary with replication enabled\n", .{});
-    std.debug.print("  {s} --mode primary --enable-wal --wal-path primary.wal --replication-port 9001\n\n", .{program_name});
+    std.debug.print("  {s} --mode primary --enable-wal --wal-path primary.wal --replication-port 9001 --auth-secret mysecret\n\n", .{program_name});
     std.debug.print("  # Replica connecting to primary\n", .{});
-    std.debug.print("  {s} --mode replica --primary-address 192.168.1.100 --primary-port 9001\n\n", .{program_name});
+    std.debug.print("  {s} --mode replica --primary-address 192.168.1.100 --primary-port 9001 --auth-secret mysecret\n\n", .{program_name});
 }
 
 fn parseArguments(allocator: std.mem.Allocator, args: [][:0]u8) !CommandLineArgs {
@@ -99,6 +101,10 @@ fn parseArguments(allocator: std.mem.Allocator, args: [][:0]u8) !CommandLineArgs
             i += 1;
             if (i >= args.len) return error.MissingValue;
             parsed_args.primary_port = try std.fmt.parseInt(u16, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--auth-secret")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            parsed_args.auth_secret = try allocator.dupe(u8, args[i]);
         } else {
             std.debug.print("Unknown argument: {s}\n", .{arg});
             return error.UnknownArgument;
@@ -119,6 +125,7 @@ fn buildDaemonConfig(args: CommandLineArgs) daemon.WildDaemon.DaemonConfig {
         .replication_port = args.replication_port,
         .primary_address = args.primary_address,
         .primary_port = args.primary_port,
+        .auth_secret = args.auth_secret,
     };
 }
 
