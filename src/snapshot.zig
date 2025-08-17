@@ -321,10 +321,10 @@ pub const SnapshotManager = struct {
         // Update last snapshot time
         self.last_snapshot_time.store(@as(u64, @intCast(std.time.timestamp())), .monotonic);
 
-        // TODO: Clean up old snapshots - requires allocation-free implementation
-        // self.cleanupOldSnapshots() catch |err| {
-        //     std.debug.print("Warning: Failed to cleanup old snapshots: {}\n", .{err});
-        // };
+        // Clean up old snapshots beyond retention limit
+        self.cleanupOldSnapshots() catch |err| {
+            std.debug.print("Warning: Failed to clean up old snapshots: {}\n", .{err});
+        };
     }
 
     // Find and load the latest valid snapshot

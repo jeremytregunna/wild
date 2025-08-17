@@ -4,6 +4,7 @@ const flat_hash_storage = @import("flat_hash_storage.zig");
 const static_allocator = @import("static_allocator.zig");
 const wal = @import("wal.zig");
 const snapshot = @import("snapshot.zig");
+const replication = @import("replication.zig");
 
 // WILD Database - Cache-Resident Ultra-High-Performance Key-Value Store
 pub const WILD = struct {
@@ -19,6 +20,10 @@ pub const WILD = struct {
 
     // Optional snapshots for recovery
     snapshot_manager: ?snapshot.SnapshotManager,
+
+    // Optional replication for read replicas and multi-writer
+    primary_replicator: ?replication.PrimaryReplicator,
+    replica_node: ?replication.ReplicaNode,
 
     // Configuration
     target_capacity: u64,
@@ -62,27 +67,40 @@ pub const WILD = struct {
             .allocator = allocator,
             .durability = null, // Initially no WAL
             .snapshot_manager = null, // Initially no snapshots
+            .primary_replicator = null, // Initially no replication
+            .replica_node = null, // Initially not a replica
             .target_capacity = config.target_capacity,
         };
     }
 
     pub fn deinit(self: *Self) void {
-        // Stop durability if enabled
-        if (self.durability) |*dur| {
-            dur.stop();
-            dur.deinit();
+        // CRITICAL SHUTDOWN ORDER - dependencies must be respected for performance and correctness
+
+        // 1. Stop replication first - replicators may depend on WAL for final batches
+        if (self.primary_replicator) |*replicator| {
+            replicator.deinit(); // Stops accepting new connections, flushes pending batches
+        }
+        if (self.replica_node) |*replica| {
+            replica.deinit(); // Disconnects from primary cleanly
         }
 
-        // Clean up snapshot manager if enabled
+        // 2. Stop durability - WAL must be stopped after replication to avoid lost writes
+        if (self.durability) |*dur| {
+            dur.stop(); // Flush remaining batches to disk
+            dur.deinit(); // Close file handles, cleanup threads
+        }
+
+        // 3. Clean up snapshot manager - may depend on storage state consistency
         if (self.snapshot_manager) |*snap_mgr| {
             snap_mgr.deinit();
         }
 
-        // Note: Caller will transition static allocator to deinit state
+        // 4. Storage cleanup - core data structures, no dependencies
         self.storage.deinit();
         self.cache_topology.deinit();
         self.allocator.destroy(self.cache_topology);
-        // Note: Caller handles static allocator and arena cleanup
+
+        // Note: Caller handles static allocator and arena cleanup for performance
     }
 
     // Core single operations - no stats overhead
@@ -300,5 +318,95 @@ pub const WILD = struct {
         if (self.shouldCreateSnapshot()) {
             try self.createSnapshot();
         }
+    }
+
+    // Enable replication as primary node
+    pub fn enableReplicationAsPrimary(self: *Self, listen_port: u16, auth_secret: []const u8) !void {
+        std.debug.assert(self.primary_replicator == null);
+        std.debug.assert(self.replica_node == null);
+
+        // Must have durability enabled to replicate
+        if (self.durability == null) {
+            return error.DurabilityRequired;
+        }
+
+        // Initialize primary replicator
+        self.primary_replicator = try replication.PrimaryReplicator.init(
+            self.allocator,
+            &self.durability.?,
+            &self.storage,
+            listen_port,
+            auth_secret,
+        );
+
+        // Set up WAL replicator for streaming batches
+        self.durability.?.setPrimaryReplicator(@ptrCast(&self.primary_replicator.?));
+
+        // Start replication
+        try self.primary_replicator.?.start();
+
+        // Replication enabled as primary
+    }
+
+    // Enable replication as replica node
+    pub fn enableReplicationAsReplica(self: *Self, primary_address: []const u8, primary_port: u16, auth_secret: []const u8) !void {
+        std.debug.assert(self.primary_replicator == null);
+        std.debug.assert(self.replica_node == null);
+
+        // Initialize replica node
+        self.replica_node = try replication.ReplicaNode.init(
+            self.allocator,
+            self,
+            undefined, // static_alloc not needed for replica operations
+        );
+
+        // Connect to primary with authentication
+        try self.replica_node.?.connectToPrimary(primary_address, primary_port, auth_secret);
+
+        // Start replica
+        try self.replica_node.?.start();
+
+        // Replication enabled as replica
+    }
+
+    // Disable replication
+    pub fn disableReplication(self: *Self) void {
+        if (self.primary_replicator) |*replicator| {
+            replicator.deinit();
+            self.primary_replicator = null;
+
+            // Remove WAL replicator
+            if (self.durability) |*dur| {
+                dur.removePrimaryReplicator();
+            }
+        }
+
+        if (self.replica_node) |*replica| {
+            replica.deinit();
+            self.replica_node = null;
+        }
+    }
+
+    // Get replication statistics
+    pub fn getReplicationStats(self: *const Self) ?union(enum) {
+        primary: replication.ReplicationStats,
+        replica: replication.ReplicaStats,
+    } {
+        if (self.primary_replicator) |*replicator| {
+            return .{ .primary = replicator.getStats() };
+        } else if (self.replica_node) |*replica| {
+            return .{ .replica = replica.getStats() };
+        }
+        return null;
+    }
+
+    // Check if this node is a primary
+    pub fn isPrimary(self: *const Self) bool {
+        return self.primary_replicator != null;
+    }
+
+    // Check if this node is a replica
+    pub fn isReplica(self: *const Self) bool {
+        return self.replica_node != null;
     }
 };

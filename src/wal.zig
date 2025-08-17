@@ -185,11 +185,35 @@ pub const WALCompletion = struct {
     }
 };
 
+// Forward declaration for replication callback
+const replication = @import("replication.zig");
+
+// WAL file metadata for retention and replication
+pub const WALFileInfo = struct {
+    file_id: u64,
+    file_path: []const u8,
+    start_batch_id: u64,
+    end_batch_id: u64,
+    file_size: u64,
+    created_timestamp: i64,
+
+    pub fn deinit(self: *WALFileInfo, allocator: std.mem.Allocator) void {
+        allocator.free(self.file_path);
+    }
+};
+
 // io_uring-optimized durability manager - completion-based architecture
 pub const DurabilityManager = struct {
-    // WAL file management
-    wal_fd: std.posix.fd_t,
-    wal_offset: std.atomic.Value(u64),
+    // WAL file management with retention
+    current_wal_fd: std.posix.fd_t,
+    current_wal_offset: std.atomic.Value(u64),
+    current_file_id: std.atomic.Value(u64),
+    wal_base_path: []const u8,
+    wal_files: std.ArrayList(WALFileInfo), // Track all WAL files for retention
+    wal_files_mutex: std.Thread.Mutex,
+
+    // Retention policy
+    config: Config,
 
     // io_uring for async I/O
     ring: std.os.linux.IoUring,
@@ -230,6 +254,10 @@ pub const DurabilityManager = struct {
     total_entries_written: std.atomic.Value(u64),
     io_errors: std.atomic.Value(u64),
 
+    // Replication integration
+    primary_replicator: ?*anyopaque, // Pointer to PrimaryReplicator for streaming batches
+    current_view_number: std.atomic.Value(u32),
+
     allocator: std.mem.Allocator,
 
     const Self = @This();
@@ -241,6 +269,11 @@ pub const DurabilityManager = struct {
         batch_buffer_count: u32,
         io_uring_entries: u16, // Size of io_uring submission queue
 
+        // WAL file retention for replication
+        max_wal_files: u32, // Keep last N WAL files for replica catch-up
+        max_file_size_mb: u32, // Roll to new file after N MB
+        retention_hours: u32, // Keep WAL files for N hours
+
         // Create config with ring buffer sized to match storage capacity exactly
         pub fn forStorage(wal_path: []const u8, storage_capacity: u32) Config {
             // WAL ring buffer must match storage capacity exactly - every storable record gets a WAL slot
@@ -251,18 +284,43 @@ pub const DurabilityManager = struct {
                 .ring_buffer_size = storage_capacity, // 1:1 correspondence
                 .batch_buffer_count = @max(8, storage_capacity / 4096), // Scale batch buffers appropriately
                 .io_uring_entries = @intCast(@max(32, @min(storage_capacity / 1024, 512))), // Scale io_uring
+
+                // Default retention policy for replication
+                .max_wal_files = 24, // Keep 24 WAL files (roughly 1 day at 1 file/hour)
+                .max_file_size_mb = 64, // 64MB per file
+                .retention_hours = 24, // 24 hour retention
             };
         }
     };
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
-        // Open WAL file with O_DIRECT for bypass page cache
+        // Store base path for creating numbered WAL files
+        const wal_base_path = try allocator.dupe(u8, config.wal_path);
+
+        // Create initial WAL file
+        const initial_file_path = try std.fmt.allocPrint(allocator, "{s}.000000", .{wal_base_path});
+        defer allocator.free(initial_file_path);
+
         const wal_fd = try std.posix.openat(
             std.posix.AT.FDCWD,
-            config.wal_path,
+            initial_file_path,
             .{ .ACCMODE = .RDWR, .CREAT = true, .DIRECT = true },
             0o644,
         );
+
+        // Initialize WAL files list
+        var wal_files = std.ArrayList(WALFileInfo).init(allocator);
+
+        // Add initial WAL file to tracking
+        const initial_file_info = WALFileInfo{
+            .file_id = 0,
+            .file_path = try allocator.dupe(u8, initial_file_path),
+            .start_batch_id = 0,
+            .end_batch_id = 0,
+            .file_size = 0,
+            .created_timestamp = std.time.timestamp(),
+        };
+        try wal_files.append(initial_file_info);
 
         // Initialize io_uring
         const ring = try std.os.linux.IoUring.init(config.io_uring_entries, 0);
@@ -299,8 +357,13 @@ pub const DurabilityManager = struct {
             (@as(u32, 1) << @intCast(actual_buffer_count)) - 1;
 
         return Self{
-            .wal_fd = wal_fd,
-            .wal_offset = std.atomic.Value(u64).init(0),
+            .current_wal_fd = wal_fd,
+            .current_wal_offset = std.atomic.Value(u64).init(0),
+            .current_file_id = std.atomic.Value(u64).init(0),
+            .wal_base_path = wal_base_path,
+            .wal_files = wal_files,
+            .wal_files_mutex = std.Thread.Mutex{},
+            .config = config,
             .ring = ring,
             .tls_wals = tls_wals,
             .current_tls_index = std.atomic.Value(u32).init(0),
@@ -322,6 +385,8 @@ pub const DurabilityManager = struct {
             .entries_dropped = std.atomic.Value(u64).init(0),
             .total_entries_written = std.atomic.Value(u64).init(0),
             .io_errors = std.atomic.Value(u64).init(0),
+            .primary_replicator = null,
+            .current_view_number = std.atomic.Value(u32).init(1),
             .allocator = allocator,
         };
     }
@@ -336,8 +401,17 @@ pub const DurabilityManager = struct {
         // Clean up io_uring
         self.ring.deinit();
 
-        // Close WAL file
-        std.posix.close(self.wal_fd);
+        // Close current WAL file
+        std.posix.close(self.current_wal_fd);
+
+        // Clean up WAL files list
+        self.wal_files_mutex.lock();
+        defer self.wal_files_mutex.unlock();
+        for (self.wal_files.items) |*file_info| {
+            file_info.deinit(self.allocator);
+        }
+        self.wal_files.deinit();
+        self.allocator.free(self.wal_base_path);
 
         // Free thread-local WAL rings
         for (self.tls_wals) |*tls_wal| {
@@ -361,6 +435,124 @@ pub const DurabilityManager = struct {
             thread.join();
             self.durability_thread = null;
         }
+    }
+
+    // Set primary replicator for streaming batches to replicas
+    pub fn setPrimaryReplicator(self: *Self, replicator: *anyopaque) void {
+        self.primary_replicator = replicator;
+    }
+
+    // Remove replication
+    pub fn removePrimaryReplicator(self: *Self) void {
+        self.primary_replicator = null;
+    }
+
+    // Set current view number for replication
+    pub fn setViewNumber(self: *Self, view_number: u32) void {
+        self.current_view_number.store(view_number, .release);
+    }
+
+    // Check if current WAL file should be rotated
+    fn shouldRotateWALFile(self: *Self) bool {
+        const current_size = self.current_wal_offset.load(.acquire);
+        const max_size = @as(u64, self.config.max_file_size_mb) * 1024 * 1024;
+        return current_size >= max_size;
+    }
+
+    // Rotate to a new WAL file
+    fn rotateWALFile(self: *Self) !void {
+        const new_file_id = self.current_file_id.fetchAdd(1, .monotonic) + 1;
+
+        // Create new WAL file path
+        const new_file_path = try std.fmt.allocPrint(self.allocator, "{s}.{:0>6}", .{ self.wal_base_path, new_file_id });
+
+        // Open new WAL file
+        const new_wal_fd = try std.posix.openat(
+            std.posix.AT.FDCWD,
+            new_file_path,
+            .{ .ACCMODE = .RDWR, .CREAT = true, .DIRECT = true },
+            0o644,
+        );
+
+        // Update current WAL file info with final batch ID
+        self.wal_files_mutex.lock();
+        defer self.wal_files_mutex.unlock();
+
+        if (self.wal_files.items.len > 0) {
+            const current_file = &self.wal_files.items[self.wal_files.items.len - 1];
+            current_file.end_batch_id = self.batches_written.load(.acquire);
+            current_file.file_size = self.current_wal_offset.load(.acquire);
+        }
+
+        // Close old file and switch to new
+        std.posix.close(self.current_wal_fd);
+        self.current_wal_fd = new_wal_fd;
+        self.current_wal_offset.store(0, .release);
+
+        // Add new file to tracking
+        const new_file_info = WALFileInfo{
+            .file_id = new_file_id,
+            .file_path = new_file_path,
+            .start_batch_id = self.batches_written.load(.acquire),
+            .end_batch_id = 0, // Will be set when file is rotated
+            .file_size = 0,
+            .created_timestamp = std.time.timestamp(),
+        };
+        try self.wal_files.append(new_file_info);
+
+        // Clean up old files
+        self.cleanupOldWALFiles();
+    }
+
+    // Remove old WAL files based on retention policy
+    fn cleanupOldWALFiles(self: *Self) void {
+        const current_time = std.time.timestamp();
+        const retention_seconds = @as(i64, self.config.retention_hours) * 3600;
+
+        var files_to_remove = std.ArrayList(usize).init(self.allocator);
+        defer files_to_remove.deinit();
+
+        // Find files to remove (keep files_mutex locked for consistency)
+        for (self.wal_files.items, 0..) |*file_info, i| {
+            const file_age = current_time - file_info.created_timestamp;
+            const should_remove_by_age = file_age > retention_seconds;
+            const should_remove_by_count = i < self.wal_files.items.len - self.config.max_wal_files;
+
+            if (should_remove_by_age or should_remove_by_count) {
+                files_to_remove.append(i) catch continue;
+            }
+        }
+
+        // Remove files in reverse order to maintain indices
+        var i = files_to_remove.items.len;
+        while (i > 0) {
+            i -= 1;
+            const file_index = files_to_remove.items[i];
+            var file_info = self.wal_files.orderedRemove(file_index);
+
+            // Delete the actual file
+            std.posix.unlink(file_info.file_path) catch {};
+            file_info.deinit(self.allocator);
+        }
+    }
+
+    // Get list of available WAL files for replica catch-up
+    pub fn getAvailableWALFiles(self: *Self, allocator: std.mem.Allocator) ![]WALFileInfo {
+        self.wal_files_mutex.lock();
+        defer self.wal_files_mutex.unlock();
+
+        const files = try allocator.alloc(WALFileInfo, self.wal_files.items.len);
+        for (self.wal_files.items, 0..) |file_info, i| {
+            files[i] = WALFileInfo{
+                .file_id = file_info.file_id,
+                .file_path = try allocator.dupe(u8, file_info.file_path),
+                .start_batch_id = file_info.start_batch_id,
+                .end_batch_id = file_info.end_batch_id,
+                .file_size = file_info.file_size,
+                .created_timestamp = file_info.created_timestamp,
+            };
+        }
+        return files;
     }
 
     // Get a thread-local WAL ring - round-robin assignment
@@ -463,6 +655,14 @@ pub const DurabilityManager = struct {
                 const entry_count = tls_wal.drainBatch(batch);
                 if (entry_count > 0) {
                     batch.batch_id = self.batches_written.fetchAdd(1, .monotonic);
+                    batch.view_number = self.current_view_number.load(.acquire);
+
+                    // Stream batch to replicas before submitting to disk
+                    // This allows replicas to receive updates with minimal latency
+                    if (self.primary_replicator) |replicator_ptr| {
+                        const replicator = @as(*replication.PrimaryReplicator, @ptrCast(@alignCast(replicator_ptr)));
+                        replicator.streamBatchToReplicas(batch);
+                    }
 
                     // Submit batch via io_uring (non-blocking)
                     self.submitBatchAsync(completion) catch |err| {
@@ -591,7 +791,7 @@ pub const DurabilityManager = struct {
                     // Strategy 3: Force fsync to ensure data is on disk
                     if (shutdown_attempts == 300) {
                         std.debug.print("Forcing fsync to ensure data persistence...\n", .{});
-                        std.posix.fsync(self.wal_fd) catch {};
+                        std.posix.fsync(self.current_wal_fd) catch {};
                     }
 
                     // Continue trying completions
@@ -640,10 +840,10 @@ pub const DurabilityManager = struct {
                 std.debug.print("✓ Shutdown complete: all {} I/Os flushed successfully after {} attempts\n", .{ initial_pending, shutdown_attempts });
             } else {
                 std.debug.print("❌ Shutdown timeout after {} attempts: {} of {} I/Os could not be completed\n", .{ shutdown_attempts, final_pending, initial_pending });
-                std.debug.print("   Data has been written to WAL file ({} bytes) but io_uring completions are stuck\n", .{self.wal_offset.load(.acquire)});
+                std.debug.print("   Data has been written to WAL file ({} bytes) but io_uring completions are stuck\n", .{self.current_wal_offset.load(.acquire)});
 
                 // Final desperate attempt: force sync
-                std.posix.fsync(self.wal_fd) catch {};
+                std.posix.fsync(self.current_wal_fd) catch {};
                 std.debug.print("   Forced fsync completed - data should be durable on disk\n", .{});
             }
         } else {
@@ -672,12 +872,20 @@ pub const DurabilityManager = struct {
             }
         };
 
+        // Check if we need to rotate WAL file before writing
+        if (self.shouldRotateWALFile()) {
+            self.rotateWALFile() catch |err| {
+                std.debug.print("WAL rotation failed: {}\n", .{err});
+                // Continue with current file if rotation fails
+            };
+        }
+
         // Calculate file offset for this batch
-        const offset = self.wal_offset.fetchAdd(@sizeOf(WALBatch), .monotonic);
+        const offset = self.current_wal_offset.fetchAdd(@sizeOf(WALBatch), .monotonic);
 
         // Prepare write operation
         sqe.prep_write(
-            self.wal_fd,
+            self.current_wal_fd,
             std.mem.asBytes(batch),
             offset,
         );
@@ -781,7 +989,7 @@ pub const DurabilityManager = struct {
             .batches_written = self.batches_written.load(.monotonic),
             .entries_dropped = self.entries_dropped.load(.monotonic),
             .total_entries_written = self.total_entries_written.load(.monotonic),
-            .wal_size_bytes = self.wal_offset.load(.monotonic),
+            .wal_size_bytes = self.current_wal_offset.load(.monotonic),
             .pending_ios = self.pending_ios.load(.monotonic),
             .completed_ios = self.completed_ios.load(.monotonic),
             .io_errors = self.io_errors.load(.monotonic),
@@ -803,7 +1011,7 @@ pub const DurabilityManager = struct {
             .batches_written = self.batches_written.load(.monotonic),
             .entries_dropped = self.entries_dropped.load(.monotonic),
             .total_entries_written = self.total_entries_written.load(.monotonic),
-            .wal_size_bytes = self.wal_offset.load(.monotonic),
+            .wal_size_bytes = self.current_wal_offset.load(.monotonic),
             .pending_ios = self.pending_ios.load(.monotonic),
             .completed_ios = self.completed_ios.load(.monotonic),
             .io_errors = self.io_errors.load(.monotonic),

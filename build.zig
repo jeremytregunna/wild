@@ -30,7 +30,7 @@ pub fn build(b: *std.Build) void {
 
     // We will also create modules for our entry points
     const server_mod = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
+        .root_source_file = b.path("main.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -41,10 +41,18 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const client_example_mod = b.createModule(.{
+        .root_source_file = b.path("client_example.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Modules can depend on one another using the `std.Build.Module.addImport` function.
     // This is what allows Zig source code to use `@import("foo")` where 'foo' is not a
     // file path. In this case, we set up server_mod to import lib_mod.
     server_mod.addImport("wildb_lib", lib_mod);
+    client_mod.addImport("wildb_lib", lib_mod);
+    client_example_mod.addImport("wildb_lib", lib_mod);
 
     // Now, we will create a static library based on the module we created above.
     // This creates a `std.Build.Step.Compile`, which is the build step responsible
@@ -72,21 +80,31 @@ pub fn build(b: *std.Build) void {
         .root_module = client_mod,
     });
 
-    // Install both executables
+    // Create the client example executable
+    const client_example_exe = b.addExecutable(.{
+        .name = "wild-client-example",
+        .root_module = client_example_mod,
+    });
+
+    // Install all executables
     b.installArtifact(server_exe);
     b.installArtifact(client_exe);
+    b.installArtifact(client_example_exe);
 
-    // Create run steps for both executables
+    // Create run steps for all executables
     const run_server_cmd = b.addRunArtifact(server_exe);
     const run_client_cmd = b.addRunArtifact(client_exe);
+    const run_client_example_cmd = b.addRunArtifact(client_example_exe);
 
     run_server_cmd.step.dependOn(b.getInstallStep());
     run_client_cmd.step.dependOn(b.getInstallStep());
+    run_client_example_cmd.step.dependOn(b.getInstallStep());
 
-    // Allow passing arguments to both executables
+    // Allow passing arguments to all executables
     if (b.args) |args| {
         run_server_cmd.addArgs(args);
         run_client_cmd.addArgs(args);
+        run_client_example_cmd.addArgs(args);
     }
 
     // Create build steps for running each executable
@@ -95,6 +113,9 @@ pub fn build(b: *std.Build) void {
 
     const run_client_step = b.step("run-client", "Run the WILD client");
     run_client_step.dependOn(&run_client_cmd.step);
+
+    const run_client_example_step = b.step("run-client-example", "Run the WILD client example");
+    run_client_example_step.dependOn(&run_client_example_cmd.step);
 
     // Default run step runs the server for backward compatibility
     const run_step = b.step("run", "Run the WILD server");
