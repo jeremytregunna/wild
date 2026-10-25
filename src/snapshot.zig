@@ -1,4 +1,5 @@
 const std = @import("std");
+const os_compat = @import("os_compat.zig");
 const flat_hash_storage = @import("flat_hash_storage.zig");
 const wal = @import("wal.zig");
 
@@ -45,7 +46,7 @@ pub const SnapshotHeader = extern struct {
     pub fn init(snapshot_id: u64, wal_position: u64, storage_stats: flat_hash_storage.StorageStats) Self {
         return Self{
             .snapshot_id = snapshot_id,
-            .creation_timestamp = @as(u64, @intCast(std.time.nanoTimestamp())),
+            .creation_timestamp = @as(u64, @intCast(os_compat.nanoTimestamp())),
             .wal_position = wal_position,
             .total_records = storage_stats.total_count,
             .total_capacity = storage_stats.total_capacity,
@@ -94,7 +95,7 @@ pub const SnapshotHeader = extern struct {
 
 // Memory-mapped snapshot file for fast recovery
 pub const SnapshotFile = struct {
-    file: std.fs.File,
+    file: os_compat.File,
     mapped_memory: []align(std.heap.page_size_min) u8,
     header: *SnapshotHeader,
     records: []flat_hash_storage.CacheLineRecord,
@@ -111,14 +112,14 @@ pub const SnapshotFile = struct {
         const aligned_size = std.mem.alignForward(usize, total_size, std.heap.page_size_min);
 
         // Create snapshot file
-        const file = try std.fs.cwd().createFile(file_path, .{ .read = true, .truncate = true });
+        const file = try os_compat.createFile(file_path, .{ .read = true, .truncate = true });
         try file.setEndPos(aligned_size);
 
         // Memory map the file
         const mapped_memory = try std.posix.mmap(
             null,
             aligned_size,
-            std.posix.PROT.READ | std.posix.PROT.WRITE,
+            std.posix.PROT{ .READ = true, .WRITE = true },
             .{ .TYPE = .SHARED },
             file.handle,
             0,
@@ -126,7 +127,7 @@ pub const SnapshotFile = struct {
 
         // Initialize header
         const header = @as(*SnapshotHeader, @ptrCast(@alignCast(mapped_memory.ptr)));
-        header.* = SnapshotHeader.init(@as(u64, @intCast(std.time.milliTimestamp())), // Use timestamp as snapshot ID
+        header.* = SnapshotHeader.init(@as(u64, @intCast(os_compat.milliTimestamp())), // Use timestamp as snapshot ID
             current_wal_position, storage_stats);
 
         // Get records array view
@@ -144,7 +145,7 @@ pub const SnapshotFile = struct {
         header.calculateHeaderChecksum();
 
         // Ensure data is written to disk
-        try std.posix.msync(mapped_memory, std.posix.MSF.SYNC);
+        try std.posix.msync(mapped_memory[0..aligned_size], std.posix.MSF.SYNC);
 
         std.debug.print("Created snapshot: {} records, {} bytes, WAL position {}\n", .{ storage_stats.total_count, aligned_size, current_wal_position });
 
@@ -158,14 +159,14 @@ pub const SnapshotFile = struct {
 
     // Load existing snapshot from disk
     pub fn load(file_path: []const u8) !Self {
-        const file = try std.fs.cwd().openFile(file_path, .{ .mode = .read_only });
+        const file = try os_compat.openFile(file_path, .{ .mode = .read_only });
         const file_size = try file.getEndPos();
 
         // Memory map the file
         const mapped_memory = try std.posix.mmap(
             null,
             file_size,
-            std.posix.PROT.READ,
+            std.posix.PROT{ .READ = true },
             .{ .TYPE = .SHARED },
             file.handle,
             0,
@@ -271,7 +272,7 @@ pub const SnapshotManager = struct {
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
         // Ensure snapshot directory exists
-        std.fs.cwd().makeDir(config.snapshot_dir) catch |err| switch (err) {
+        os_compat.makeDir(config.snapshot_dir) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
@@ -296,7 +297,7 @@ pub const SnapshotManager = struct {
 
     // Check if it's time to create a new snapshot
     pub fn shouldCreateSnapshot(self: *const Self) bool {
-        const now = @as(u64, @intCast(std.time.timestamp()));
+        const now = @as(u64, @intCast(os_compat.timestamp()));
         const last_snapshot = self.last_snapshot_time.load(.monotonic);
         return (now - last_snapshot) >= self.snapshot_interval_seconds;
     }
@@ -319,7 +320,7 @@ pub const SnapshotManager = struct {
         self.current_snapshot = new_snapshot;
 
         // Update last snapshot time
-        self.last_snapshot_time.store(@as(u64, @intCast(std.time.timestamp())), .monotonic);
+        self.last_snapshot_time.store(@as(u64, @intCast(os_compat.timestamp())), .monotonic);
 
         // Clean up old snapshots beyond retention limit
         self.cleanupOldSnapshots() catch |err| {
@@ -329,7 +330,7 @@ pub const SnapshotManager = struct {
 
     // Find and load the latest valid snapshot
     pub fn loadLatestSnapshot(self: *Self) !?SnapshotFile {
-        var dir = try std.fs.cwd().openDir(self.snapshot_dir, .{ .iterate = true });
+        var dir = try os_compat.openDir(self.snapshot_dir, .{ .iterate = true });
         defer dir.close();
 
         var iterator = dir.iterate();
@@ -375,15 +376,15 @@ pub const SnapshotManager = struct {
 
     // Clean up old snapshots, keeping only max_snapshots
     fn cleanupOldSnapshots(self: *Self) !void {
-        var dir = try std.fs.cwd().openDir(self.snapshot_dir, .{ .iterate = true });
+        var dir = try os_compat.openDir(self.snapshot_dir, .{ .iterate = true });
         defer dir.close();
 
-        var snapshot_files = std.ArrayList(struct { name: []u8, id: u64 }).init(self.allocator);
+        var snapshot_files: std.ArrayList(struct { name: []u8, id: u64 }) = .empty;
         defer {
             for (snapshot_files.items) |item| {
                 self.allocator.free(item.name);
             }
-            snapshot_files.deinit();
+            snapshot_files.deinit(self.allocator);
         }
 
         // Collect all snapshot files
@@ -393,7 +394,7 @@ pub const SnapshotManager = struct {
                 if (std.mem.startsWith(u8, entry.name, "wild_snapshot_")) {
                     const id_str = entry.name[14..24];
                     if (std.fmt.parseInt(u64, id_str, 10)) |snapshot_id| {
-                        try snapshot_files.append(.{
+                        try snapshot_files.append(self.allocator, .{
                             .name = try self.allocator.dupe(u8, entry.name),
                             .id = snapshot_id,
                         });
@@ -438,7 +439,7 @@ pub const WALReplayer = struct {
 
     // Replay WAL entries from a specific position to recover database state
     pub fn replayFromPosition(self: *Self, storage: *flat_hash_storage.FlatHashStorage, start_position: u64, end_position: ?u64) !u64 {
-        const file = std.fs.cwd().openFile(self.wal_file_path, .{ .mode = .read_only }) catch |err| switch (err) {
+        const file = os_compat.openFile(self.wal_file_path, .{ .mode = .read_only }) catch |err| switch (err) {
             error.FileNotFound => {
                 std.debug.print("WAL file not found, no replay needed\n", .{});
                 return start_position;
@@ -505,7 +506,7 @@ pub const WALReplayer = struct {
 
     // Get the current end position of the WAL file
     pub fn getCurrentWALPosition(self: *Self) !u64 {
-        const file = std.fs.cwd().openFile(self.wal_file_path, .{ .mode = .read_only }) catch |err| switch (err) {
+        const file = os_compat.openFile(self.wal_file_path, .{ .mode = .read_only }) catch |err| switch (err) {
             error.FileNotFound => return 0,
             else => return err,
         };
@@ -516,7 +517,7 @@ pub const WALReplayer = struct {
 
     // Validate WAL integrity from a specific position
     pub fn validateWAL(self: *Self, start_position: u64) !bool {
-        const file = std.fs.cwd().openFile(self.wal_file_path, .{ .mode = .read_only }) catch |err| switch (err) {
+        const file = os_compat.openFile(self.wal_file_path, .{ .mode = .read_only }) catch |err| switch (err) {
             error.FileNotFound => return true, // No WAL file means nothing to validate
             else => return err,
         };

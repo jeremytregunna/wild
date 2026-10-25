@@ -121,13 +121,53 @@ pub const WILD = struct {
     }
 
     // Batch operations for maximum performance - caller must provide result array
+    /// Keys per prefetch group when a batch read goes through the pipelined
+    /// path. Measured on Ryzen 7 7800X3D with `benchmark --mode sweep`, which
+    /// tries 1, 4, 8, 16, 32, 64, 128 and 256: 8 is best at both L3-resident
+    /// (14.4 ns/op) and DRAM-resident (21.3 ns/op) table sizes, and the curve
+    /// is flat from 4 to 16. Bigger groups get worse, because the position
+    /// array stops fitting in L1 and the last group is resolved long after its
+    /// lines arrived. See docs/bench.
+    pub const default_microbatch: usize = 8;
+
+    /// Minimum keys worth the pipelined path. Below it the position arrays and
+    /// the extra branches cost more than the misses they hide: a hit is one
+    /// 64-byte line and about 7 ns.
+    pub const pipelined_threshold: usize = 8;
+
     pub fn readBatch(self: *Self, keys: []const u64, results: []?*const flat_hash_storage.CacheLineRecord) void {
         std.debug.assert(keys.len == results.len);
 
-        // Simple loop - cache-line access is already optimized
+        if (keys.len >= pipelined_threshold) {
+            _ = self.storage.readBatchPipelined(keys, results, default_microbatch);
+            return;
+        }
+
+        // Short batches: the plain loop wins, and it is the same code the
+        // single-read path runs.
+        self.readBatchSimple(keys, results);
+    }
+
+    /// Batch read with no prefetch: one lookup after another, so each chain
+    /// waits for its own miss. This is the baseline the pipelined path has to
+    /// beat, and the path short batches take.
+    pub fn readBatchSimple(self: *Self, keys: []const u64, results: []?*const flat_hash_storage.CacheLineRecord) void {
+        std.debug.assert(keys.len == results.len);
         for (keys, 0..) |key, i| {
             results[i] = self.storage.read(key);
         }
+    }
+
+    /// Batch read with a chosen microbatch size. `micro` is comptime so the
+    /// benchmark can sweep it and pick the value from measurement.
+    pub fn readBatchPipelined(
+        self: *Self,
+        keys: []const u64,
+        results: []?*const flat_hash_storage.CacheLineRecord,
+        comptime micro: usize,
+    ) usize {
+        std.debug.assert(keys.len == results.len);
+        return self.storage.readBatchPipelined(keys, results, micro);
     }
 
     // Simplified write batch - no complex batching needed with cache-line approach
@@ -279,7 +319,7 @@ pub const WILD = struct {
     pub fn createSnapshot(self: *Self) !void {
         if (self.snapshot_manager) |*snap_mgr| {
             const current_wal_position = if (self.durability) |*dur|
-                dur.wal_offset.load(.monotonic)
+                dur.current_wal_offset.load(.monotonic)
             else
                 0;
 
@@ -298,7 +338,7 @@ pub const WILD = struct {
 
             // Update WAL offset if durability is enabled
             if (self.durability) |*dur| {
-                dur.wal_offset.store(final_wal_position, .monotonic);
+                dur.current_wal_offset.store(final_wal_position, .monotonic);
             }
         } else {
             return error.SnapshotsNotEnabled;

@@ -1,4 +1,5 @@
 const std = @import("std");
+const os_compat = @import("os_compat.zig");
 const wild = @import("wild.zig");
 const wal = @import("wal.zig");
 const flat_hash_storage = @import("flat_hash_storage.zig");
@@ -82,7 +83,7 @@ pub const ReplicaConnection = struct {
         );
 
         const total_size = @sizeOf(ReplicationMessage) + @sizeOf(wal.WALBatch);
-        const bytes_sent = std.posix.send(self.socket_fd, self.send_buffer[0..total_size], 0) catch |err| {
+        const bytes_sent = os_compat.send(self.socket_fd, self.send_buffer[0..total_size], 0) catch |err| {
             switch (err) {
                 error.BrokenPipe, error.ConnectionResetByPeer, error.NetworkUnreachable => {
                     // Expected network errors - mark as disconnected without logging
@@ -110,7 +111,7 @@ pub const ReplicaConnection = struct {
         if (!self.is_connected.load(.acquire)) return false;
 
         const message = ReplicationMessage.init(.heartbeat, view_number, 0, 0, 0);
-        const bytes_sent = std.posix.send(self.socket_fd, std.mem.asBytes(&message), 0) catch |err| {
+        const bytes_sent = os_compat.send(self.socket_fd, std.mem.asBytes(&message), 0) catch |err| {
             switch (err) {
                 error.BrokenPipe, error.ConnectionResetByPeer, error.NetworkUnreachable => {
                     // Expected network errors - mark as disconnected silently
@@ -129,7 +130,7 @@ pub const ReplicaConnection = struct {
             return false;
         }
 
-        self.last_heartbeat.store(std.time.timestamp(), .release);
+        self.last_heartbeat.store(os_compat.timestamp(), .release);
         return true;
     }
 };
@@ -167,12 +168,12 @@ pub const PrimaryReplicator = struct {
 
     pub fn init(allocator: std.mem.Allocator, wal_manager: *wal.DurabilityManager, database_storage: *flat_hash_storage.FlatHashStorage, listen_port: u16, auth_secret: []const u8) !Self {
         // Create listening socket for replica connections
-        const listen_fd = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+        const listen_fd = try os_compat.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
         try std.posix.setsockopt(listen_fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
 
-        const addr = try std.net.Address.parseIp("0.0.0.0", listen_port);
-        try std.posix.bind(listen_fd, &addr.any, addr.getOsSockLen());
-        try std.posix.listen(listen_fd, 16);
+        const addr = try os_compat.Address.parseIp("0.0.0.0", listen_port);
+        try os_compat.bind(listen_fd, &addr.any, addr.getOsSockLen());
+        try os_compat.listen(listen_fd, 16);
 
         // Pre-allocate all replica connection memory
         const replica_connections = try allocator.alloc(ReplicaConnection, MAX_REPLICAS);
@@ -222,7 +223,7 @@ pub const PrimaryReplicator = struct {
         // Clean up active replica connections
         for (self.replica_connections) |*replica| {
             if (replica.socket_fd != -1) {
-                std.posix.close(replica.socket_fd);
+                os_compat.close(replica.socket_fd);
             }
         }
 
@@ -233,7 +234,7 @@ pub const PrimaryReplicator = struct {
         self.allocator.free(self.replica_send_buffers);
         self.allocator.free(self.replica_connections);
 
-        std.posix.close(self.listen_fd);
+        os_compat.close(self.listen_fd);
     }
 
     pub fn start(self: *Self) !void {
@@ -259,11 +260,11 @@ pub const PrimaryReplicator = struct {
     }
 
     fn replicationLoop(self: *Self) void {
-        var last_heartbeat = std.time.milliTimestamp();
+        var last_heartbeat = os_compat.milliTimestamp();
         var last_batch_check = self.wal_manager.batches_written.load(.acquire);
 
         while (!self.should_stop.load(.acquire)) {
-            const current_time = std.time.milliTimestamp();
+            const current_time = os_compat.milliTimestamp();
 
             // Phase 1: Accept new replica connections (non-blocking)
             self.acceptNewReplicas();
@@ -297,7 +298,7 @@ pub const PrimaryReplicator = struct {
             }
 
             // Phase 7: Brief sleep to avoid busy waiting
-            std.time.sleep(1_000_000); // 1ms
+            os_compat.sleep(1_000_000); // 1ms
         }
 
         // Replication loop stopped
@@ -308,7 +309,7 @@ pub const PrimaryReplicator = struct {
         var addr: std.posix.sockaddr = undefined;
         var addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
 
-        const replica_fd = std.posix.accept(self.listen_fd, &addr, &addr_len, std.posix.SOCK.NONBLOCK) catch |err| {
+        const replica_fd = os_compat.accept(self.listen_fd, &addr, &addr_len, std.posix.SOCK.NONBLOCK) catch |err| {
             switch (err) {
                 error.WouldBlock => return, // No pending connections
                 else => {
@@ -324,7 +325,7 @@ pub const PrimaryReplicator = struct {
             if (replica.socket_fd == -1) { // Unused slot
                 replica.socket_fd = replica_fd;
                 replica.last_batch_id.store(0, .release);
-                replica.last_heartbeat.store(std.time.timestamp(), .release);
+                replica.last_heartbeat.store(os_compat.timestamp(), .release);
                 replica.is_connected.store(true, .release);
                 replica.is_bootstrapping.store(false, .release);
                 replica.bootstrap_last_batch_requested.store(0, .release);
@@ -339,13 +340,13 @@ pub const PrimaryReplicator = struct {
 
         if (!slot_found) {
             // No available slots, reject connection
-            std.posix.close(replica_fd);
+            os_compat.close(replica_fd);
             _ = self.replication_errors.fetchAdd(1, .monotonic);
         }
     }
 
     fn cleanupDisconnectedReplicas(self: *Self) void {
-        const current_time = std.time.timestamp();
+        const current_time = os_compat.timestamp();
 
         for (self.replica_connections) |*replica| {
             if (replica.socket_fd != -1 and
@@ -353,7 +354,7 @@ pub const PrimaryReplicator = struct {
                     (current_time - replica.last_heartbeat.load(.acquire)) > (REPLICA_TIMEOUT_MS / 1000)))
             {
                 // Clean up disconnected replica
-                std.posix.close(replica.socket_fd);
+                os_compat.close(replica.socket_fd);
                 replica.socket_fd = -1; // Mark as unused
                 replica.is_connected.store(false, .release);
 
@@ -401,7 +402,7 @@ pub const PrimaryReplicator = struct {
     fn checkForBootstrapRequest(self: *Self, replica: *ReplicaConnection) void {
         // Check for incoming bootstrap request messages
         var temp_buffer: [64]u8 = undefined;
-        const bytes_available = std.posix.recv(replica.socket_fd, &temp_buffer, std.posix.MSG.DONTWAIT | std.posix.MSG.PEEK) catch |err| {
+        const bytes_available = os_compat.recv(replica.socket_fd, &temp_buffer, std.posix.MSG.DONTWAIT | std.posix.MSG.PEEK) catch |err| {
             switch (err) {
                 error.WouldBlock => return, // No data available
                 error.ConnectionResetByPeer => {
@@ -422,7 +423,7 @@ pub const PrimaryReplicator = struct {
 
             if (message.message_type == .bootstrap_request) {
                 // Actually consume the message
-                _ = std.posix.recv(replica.socket_fd, temp_buffer[0..@sizeOf(ReplicationMessage)], 0) catch return;
+                _ = os_compat.recv(replica.socket_fd, temp_buffer[0..@sizeOf(ReplicationMessage)], 0) catch return;
 
                 // Start bootstrap process
                 replica.is_bootstrapping.store(true, .release);
@@ -464,7 +465,7 @@ pub const PrimaryReplicator = struct {
             @memcpy(replica.send_buffer[@sizeOf(ReplicationMessage) .. @sizeOf(ReplicationMessage) + chunk.len], chunk);
 
             const total_size = @sizeOf(ReplicationMessage) + chunk.len;
-            const bytes_sent = std.posix.send(replica.socket_fd, replica.send_buffer[0..total_size], 0) catch {
+            const bytes_sent = os_compat.send(replica.socket_fd, replica.send_buffer[0..total_size], 0) catch {
                 replica.is_bootstrapping.store(false, .release);
                 replica.is_connected.store(false, .release);
                 return;
@@ -489,7 +490,7 @@ pub const PrimaryReplicator = struct {
             0,
         );
 
-        _ = std.posix.send(replica.socket_fd, std.mem.asBytes(&complete_message), 0) catch {
+        _ = os_compat.send(replica.socket_fd, std.mem.asBytes(&complete_message), 0) catch {
             replica.is_connected.store(false, .release);
             return;
         };
@@ -605,7 +606,7 @@ pub const PrimaryReplicator = struct {
         for (self.wal_manager.wal_files.items) |*wal_file| {
             if (batch_id >= wal_file.start_batch_id and batch_id <= wal_file.end_batch_id) {
                 // Found the right file, read the batch
-                const file = std.fs.cwd().openFile(wal_file.file_path, .{}) catch return null;
+                const file = os_compat.openFile(wal_file.file_path, .{}) catch return null;
                 defer file.close();
 
                 // Calculate offset for this batch in the file
@@ -710,32 +711,32 @@ pub const ReplicaNode = struct {
         self.stop();
         if (self.primary_connection) |*conn| {
             if (conn.socket_fd != -1) {
-                std.posix.close(conn.socket_fd);
+                os_compat.close(conn.socket_fd);
             }
             self.allocator.free(conn.send_buffer);
         }
     }
 
     pub fn connectToPrimary(self: *Self, primary_address: []const u8, primary_port: u16, auth_secret: []const u8) !void {
-        const sock_fd = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
-        const addr = try std.net.Address.parseIp(primary_address, primary_port);
+        const sock_fd = try os_compat.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+        const addr = try os_compat.Address.parseIp(primary_address, primary_port);
 
-        try std.posix.connect(sock_fd, &addr.any, addr.getOsSockLen());
+        try os_compat.connect(sock_fd, &addr.any, addr.getOsSockLen());
 
         // Send authentication request to primary
         const auth_message = ReplicationMessage.init(.auth_request, 0, 0, 0, @intCast(auth_secret.len));
-        _ = try std.posix.send(sock_fd, std.mem.asBytes(&auth_message), 0);
+        _ = try os_compat.send(sock_fd, std.mem.asBytes(&auth_message), 0);
         if (auth_secret.len > 0) {
-            _ = try std.posix.send(sock_fd, auth_secret, 0);
+            _ = try os_compat.send(sock_fd, auth_secret, 0);
         }
 
         // Receive authentication response
         var response_bytes: [@sizeOf(ReplicationMessage)]u8 = undefined;
-        _ = try std.posix.recv(sock_fd, &response_bytes, 0);
+        _ = try os_compat.recv(sock_fd, &response_bytes, 0);
         const response = std.mem.bytesToValue(ReplicationMessage, &response_bytes);
 
         if (response.message_type != .auth_response or response.view_number != 0) {
-            std.posix.close(sock_fd);
+            os_compat.close(sock_fd);
             return error.AuthenticationFailed;
         }
 
@@ -745,7 +746,7 @@ pub const ReplicaNode = struct {
         self.primary_connection = ReplicaConnection{
             .socket_fd = sock_fd,
             .last_batch_id = std.atomic.Value(u64).init(0),
-            .last_heartbeat = std.atomic.Value(i64).init(std.time.timestamp()),
+            .last_heartbeat = std.atomic.Value(i64).init(os_compat.timestamp()),
             .is_connected = std.atomic.Value(bool).init(true),
             .send_buffer = send_buffer,
             .allocator = self.allocator,
@@ -786,7 +787,7 @@ pub const ReplicaNode = struct {
                 }
 
                 // Receive data into buffer after existing data
-                const bytes_received = std.posix.recv(conn.socket_fd, receive_buffer[buffer_used..], 0) catch {
+                const bytes_received = os_compat.recv(conn.socket_fd, receive_buffer[buffer_used..], 0) catch {
                     _ = self.connection_errors.fetchAdd(1, .monotonic);
                     conn.is_connected.store(false, .release);
                     break;
@@ -832,7 +833,7 @@ pub const ReplicaNode = struct {
                 break;
             }
 
-            std.time.sleep(100_000); // 100μs
+            os_compat.sleep(100_000); // 100μs
         }
 
         // Replica loop stopped
@@ -849,7 +850,7 @@ pub const ReplicaNode = struct {
                 0,
             );
 
-            _ = std.posix.send(conn.socket_fd, std.mem.asBytes(&message), 0) catch {
+            _ = os_compat.send(conn.socket_fd, std.mem.asBytes(&message), 0) catch {
                 conn.is_connected.store(false, .release);
             };
         }
@@ -891,7 +892,7 @@ pub const ReplicaNode = struct {
         // Production: no debug logging
 
         // Validate message type (1=auth_request, 2=auth_response, 3=wal_batch, 4=heartbeat, 5=bootstrap_request, 6=snapshot_data, 7=bootstrap_complete)
-        const raw_type = @intFromEnum(message.message_type);
+        const raw_type = @backingInt(message.message_type);
         if (raw_type < 1 or raw_type > 7) return;
 
         switch (message.message_type) {

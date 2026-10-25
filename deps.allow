@@ -1,0 +1,6 @@
+# Packages a WILD build may fetch. One entry per line: name=version.
+#
+# WILD has no third-party dependencies, and scripts/verify fails if
+# build.zig.zon declares any. Add a line here in the same commit as the
+# dependency, so the approval shows in the diff. A new dependency needs
+# human approval first.

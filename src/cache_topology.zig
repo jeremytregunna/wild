@@ -111,8 +111,8 @@ pub const CacheTopology = struct {
 };
 
 fn parseCpuList(allocator: std.mem.Allocator, cpu_list_str: []const u8) ![]u32 {
-    var cpus = std.ArrayList(u32).init(allocator);
-    defer cpus.deinit();
+    var cpus: std.ArrayList(u32) = .empty;
+    defer cpus.deinit(allocator);
 
     var ranges = std.mem.tokenizeAny(u8, cpu_list_str, ",");
     while (ranges.next()) |range| {
@@ -121,15 +121,15 @@ fn parseCpuList(allocator: std.mem.Allocator, cpu_list_str: []const u8) ![]u32 {
             const end = try std.fmt.parseInt(u32, range[dash_pos + 1 ..], 10);
             var i = start;
             while (i <= end) : (i += 1) {
-                try cpus.append(i);
+                try cpus.append(allocator, i);
             }
         } else {
             const cpu = try std.fmt.parseInt(u32, range, 10);
-            try cpus.append(cpu);
+            try cpus.append(allocator, cpu);
         }
     }
 
-    return cpus.toOwnedSlice();
+    return cpus.toOwnedSlice(allocator);
 }
 
 const CpuTopologyInfo = struct {
@@ -159,8 +159,7 @@ fn getCpuTopologyInfo() ?CpuTopologyInfo {
           [edx] "={edx}" (edx_out),
         : [leaf] "{eax}" (@as(u32, 0)),
           [subleaf] "{ecx}" (@as(u32, 0)),
-        : "memory"
-    );
+        : .{ .memory = true });
 
     // Check if we have enough CPUID leaves
     if (eax_out < 0xB) {
@@ -175,8 +174,7 @@ fn getCpuTopologyInfo() ?CpuTopologyInfo {
           [edx] "={edx}" (edx_out),
         : [leaf] "{eax}" (@as(u32, 1)),
           [subleaf] "{ecx}" (@as(u32, 0)),
-        : "memory"
-    );
+        : .{ .memory = true });
 
     const apic_id = (ebx_out >> 24) & 0xFF;
 
@@ -189,8 +187,7 @@ fn getCpuTopologyInfo() ?CpuTopologyInfo {
           [edx] "={edx}" (edx_out),
         : [leaf] "{eax}" (@as(u32, 0xB)),
           [subleaf] "{ecx}" (@as(u32, 0)),
-        : "memory"
-    );
+        : .{ .memory = true });
 
     if ((ecx_out & 0xFF00) == 0) {
         // No topology information available
@@ -207,8 +204,7 @@ fn getCpuTopologyInfo() ?CpuTopologyInfo {
           [edx] "={edx}" (edx_out),
         : [leaf] "{eax}" (@as(u32, 0xB)),
           [subleaf] "{ecx}" (@as(u32, 1)),
-        : "memory"
-    );
+        : .{ .memory = true });
 
     const core_and_logical_bits = @as(u8, @intCast(eax_out & 0x1F));
     const core_bits = core_and_logical_bits - logical_cpu_bits;
@@ -267,8 +263,7 @@ fn detectCacheLineSize() u32 {
               [edx] "={edx}" (edx_out),
             : [leaf] "{eax}" (@as(u32, 1)),
               [subleaf] "{ecx}" (@as(u32, 0)),
-            : "memory"
-        );
+            : .{ .memory = true });
 
         // Extract cache line size from EBX bits 15:8
         const cache_line_units = (ebx_out >> 8) & 0xFF;
@@ -292,8 +287,8 @@ fn detectCacheInfoCpuid(allocator: std.mem.Allocator) ![]CacheInfo {
         return &[_]CacheInfo{};
     }
 
-    var cache_list = std.ArrayList(CacheInfo).init(allocator);
-    defer cache_list.deinit();
+    var cache_list: std.ArrayList(CacheInfo) = .empty;
+    defer cache_list.deinit(allocator);
 
     const topo_info = getCpuTopologyInfo();
 
@@ -310,8 +305,7 @@ fn detectCacheInfoCpuid(allocator: std.mem.Allocator) ![]CacheInfo {
           [edx] "={edx}" (edx_out),
         : [leaf] "{eax}" (@as(u32, 0)),
           [subleaf] "{ecx}" (@as(u32, 0)),
-        : "memory"
-    );
+        : .{ .memory = true });
 
     const max_std_function = eax_out;
 
@@ -327,8 +321,7 @@ fn detectCacheInfoCpuid(allocator: std.mem.Allocator) ![]CacheInfo {
               [edx] "={edx}" (edx_out),
             : [leaf] "{eax}" (@as(u32, 0x80000000)),
               [subleaf] "{ecx}" (@as(u32, 0)),
-            : "memory"
-        );
+            : .{ .memory = true });
 
         const max_extended = eax_out;
 
@@ -343,8 +336,7 @@ fn detectCacheInfoCpuid(allocator: std.mem.Allocator) ![]CacheInfo {
                       [edx] "={edx}" (edx_out),
                     : [leaf] "{eax}" (@as(u32, 0x8000001D)),
                       [subleaf] "{ecx}" (cache_index),
-                    : "memory"
-                );
+                    : .{ .memory = true });
 
                 const cache_type = eax_out & 0x1F;
                 if (cache_type == 0) break; // No more cache levels
@@ -373,8 +365,7 @@ fn detectCacheInfoCpuid(allocator: std.mem.Allocator) ![]CacheInfo {
                           [edx] "={edx}" (cpuid_edx),
                         : [leaf] "{eax}" (@as(u32, 0xB)),
                           [subleaf] "{ecx}" (@as(u32, 1)),
-                        : "memory"
-                    );
+                        : .{ .memory = true });
 
                     total_logical_cpus = cpuid_ebx & 0xFFFF;
                 }
@@ -390,7 +381,7 @@ fn detectCacheInfoCpuid(allocator: std.mem.Allocator) ![]CacheInfo {
                     shared_cpus[i] = @as(u32, @intCast(i));
                 }
 
-                try cache_list.append(CacheInfo{
+                try cache_list.append(allocator, CacheInfo{
                     .cache_type = @as(u8, @intCast(cache_type)),
                     .cache_level = cache_level,
                     .cache_size_kb = cache_size,
@@ -412,8 +403,7 @@ fn detectCacheInfoCpuid(allocator: std.mem.Allocator) ![]CacheInfo {
                       [edx] "={edx}" (edx_out),
                     : [leaf] "{eax}" (@as(u32, 4)),
                       [subleaf] "{ecx}" (cache_index),
-                    : "memory"
-                );
+                    : .{ .memory = true });
 
                 const cache_type = eax_out & 0x1F;
                 if (cache_type == 0) break; // No more cache levels
@@ -436,7 +426,7 @@ fn detectCacheInfoCpuid(allocator: std.mem.Allocator) ![]CacheInfo {
                     shared_cpus[i] = @as(u32, @intCast(i));
                 }
 
-                try cache_list.append(CacheInfo{
+                try cache_list.append(allocator, CacheInfo{
                     .cache_type = @as(u8, @intCast(cache_type)),
                     .cache_level = cache_level,
                     .cache_size_kb = cache_size,
@@ -448,14 +438,14 @@ fn detectCacheInfoCpuid(allocator: std.mem.Allocator) ![]CacheInfo {
         }
     }
 
-    return try cache_list.toOwnedSlice();
+    return try cache_list.toOwnedSlice(allocator);
 }
 
 pub fn analyzeCacheTopology(allocator: std.mem.Allocator) !CacheTopology {
-    var l3_domains = std.ArrayList(CacheDomain).init(allocator);
-    defer l3_domains.deinit();
-    var l2_domains = std.ArrayList(CacheDomain).init(allocator);
-    defer l2_domains.deinit();
+    var l3_domains: std.ArrayList(CacheDomain) = .empty;
+    defer l3_domains.deinit(allocator);
+    var l2_domains: std.ArrayList(CacheDomain) = .empty;
+    defer l2_domains.deinit(allocator);
 
     // Get CPU topology information using CPUID
     const topo_info = getCpuTopologyInfo();
@@ -480,8 +470,7 @@ pub fn analyzeCacheTopology(allocator: std.mem.Allocator) !CacheTopology {
               [edx] "={edx}" (edx_out),
             : [leaf] "{eax}" (@as(u32, 0xB)),
               [subleaf] "{ecx}" (@as(u32, 1)),
-            : "memory"
-        );
+            : .{ .memory = true });
 
         total_logical_cpus = ebx_out & 0xFFFF;
 
@@ -530,19 +519,20 @@ pub fn analyzeCacheTopology(allocator: std.mem.Allocator) !CacheTopology {
             }
 
             // Create CPU list string for compatibility
-            var cpu_list_str = std.ArrayList(u8).init(allocator);
-            defer cpu_list_str.deinit();
+            var cpu_list_str: std.ArrayList(u8) = .empty;
+            defer cpu_list_str.deinit(allocator);
 
+            var number_buffer: [20]u8 = undefined;
             for (cache_info.shared_cpu_list, 0..) |cpu_id, i| {
-                if (i > 0) try cpu_list_str.append(',');
-                try std.fmt.format(cpu_list_str.writer(), "{d}", .{cpu_id});
+                if (i > 0) try cpu_list_str.append(allocator, ',');
+                try cpu_list_str.appendSlice(allocator, try std.fmt.bufPrint(&number_buffer, "{d}", .{cpu_id}));
             }
 
-            try l3_domains.append(.{
+            try l3_domains.append(allocator, .{
                 .domain_id = @intCast(l3_domains.items.len),
                 .cache_size_kb = cache_info.cache_size_kb,
                 .cpus = cpu_cores,
-                .cpu_list_str = try cpu_list_str.toOwnedSlice(),
+                .cpu_list_str = try cpu_list_str.toOwnedSlice(allocator),
             });
         }
     }
@@ -571,36 +561,37 @@ pub fn analyzeCacheTopology(allocator: std.mem.Allocator) !CacheTopology {
         }
 
         // Create CPU list string
-        var cpu_list_str = std.ArrayList(u8).init(allocator);
-        defer cpu_list_str.deinit();
+        var cpu_list_str: std.ArrayList(u8) = .empty;
+        defer cpu_list_str.deinit(allocator);
 
+        var number_buffer: [20]u8 = undefined;
         for (0..total_logical_cpus) |i| {
-            if (i > 0) try cpu_list_str.append(',');
-            try std.fmt.format(cpu_list_str.writer(), "{d}", .{i});
+            if (i > 0) try cpu_list_str.append(allocator, ',');
+            try cpu_list_str.appendSlice(allocator, try std.fmt.bufPrint(&number_buffer, "{d}", .{i}));
         }
 
-        try l3_domains.append(.{
+        try l3_domains.append(allocator, .{
             .domain_id = 0,
             .cache_size_kb = 8192, // Default 8MB L3 cache assumption
             .cpus = cpu_cores,
-            .cpu_list_str = try cpu_list_str.toOwnedSlice(),
+            .cpu_list_str = try cpu_list_str.toOwnedSlice(allocator),
         });
     }
 
     // Convert to owned slices
-    const owned_l3_domains = try l3_domains.toOwnedSlice();
-    const owned_l2_domains = try l2_domains.toOwnedSlice();
+    const owned_l3_domains = try l3_domains.toOwnedSlice(allocator);
+    const owned_l2_domains = try l2_domains.toOwnedSlice(allocator);
 
     // Create shard mappings
     var shard_mappings = try allocator.alloc(ShardMapping, owned_l3_domains.len);
     for (owned_l3_domains, 0..) |*domain, i| {
         // Select preferred CPUs (physical cores first, then some SMT if needed)
-        var preferred = std.ArrayList(u32).init(allocator);
+        var preferred: std.ArrayList(u32) = .empty;
 
         // Add all physical cores first
         for (domain.cpus) |cpu| {
             if (!cpu.is_smt_sibling) {
-                try preferred.append(cpu.cpu_id);
+                try preferred.append(allocator, cpu.cpu_id);
             }
         }
 
@@ -608,7 +599,7 @@ pub fn analyzeCacheTopology(allocator: std.mem.Allocator) !CacheTopology {
         if (preferred.items.len < 4) {
             for (domain.cpus) |cpu| {
                 if (cpu.is_smt_sibling and preferred.items.len < 4) {
-                    try preferred.append(cpu.cpu_id);
+                    try preferred.append(allocator, cpu.cpu_id);
                 }
             }
         }
@@ -616,7 +607,7 @@ pub fn analyzeCacheTopology(allocator: std.mem.Allocator) !CacheTopology {
         shard_mappings[i] = .{
             .shard_id = @intCast(i),
             .cache_domain = domain,
-            .preferred_cpus = try preferred.toOwnedSlice(),
+            .preferred_cpus = try preferred.toOwnedSlice(allocator),
         };
     }
 

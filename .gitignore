@@ -8,3 +8,6 @@ zig-cache/
 benchmark
 main
 .DS_Store
+.pi/
+*.wal
+*.snapshot

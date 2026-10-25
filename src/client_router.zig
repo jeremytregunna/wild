@@ -1,4 +1,5 @@
 const std = @import("std");
+const os_compat = @import("os_compat.zig");
 const wild = @import("wild.zig");
 const wire_protocol = @import("wire_protocol.zig");
 
@@ -8,7 +9,7 @@ pub const ClientRouter = struct {
     allocator: std.mem.Allocator,
     primary_endpoint: Endpoint,
     replica_endpoints: []Endpoint,
-    active_replicas: std.ArrayList(u32),
+    active_replicas: std.ArrayListUnmanaged(u32),
     next_replica_index: std.atomic.Value(u32),
     auth_secret: []const u8,
 
@@ -31,7 +32,7 @@ pub const ClientRouter = struct {
     };
 
     pub const ConnectionPool = struct {
-        connections: std.ArrayList(Connection),
+        connections: std.ArrayListUnmanaged(Connection),
         max_connections: u32,
         active_connections: std.atomic.Value(u32),
         allocator: std.mem.Allocator,
@@ -44,7 +45,7 @@ pub const ClientRouter = struct {
 
         pub fn init(allocator: std.mem.Allocator, max_connections: u32) ConnectionPool {
             return ConnectionPool{
-                .connections = std.ArrayList(Connection).init(allocator),
+                .connections = std.ArrayListUnmanaged(Connection).empty,
                 .max_connections = max_connections,
                 .active_connections = std.atomic.Value(u32).init(0),
                 .allocator = allocator,
@@ -54,17 +55,17 @@ pub const ClientRouter = struct {
         pub fn deinit(self: *ConnectionPool) void {
             for (self.connections.items) |*conn| {
                 if (conn.is_connected.load(.acquire)) {
-                    std.posix.close(conn.socket_fd);
+                    os_compat.close(conn.socket_fd);
                 }
             }
-            self.connections.deinit();
+            self.connections.deinit(self.allocator);
         }
 
         pub fn getConnection(self: *ConnectionPool, endpoint: *const Endpoint, auth_secret: []const u8) !std.posix.fd_t {
             // Try to reuse existing connection
             for (self.connections.items) |*conn| {
                 if (conn.is_connected.load(.acquire)) {
-                    conn.last_used.store(std.time.timestamp(), .release);
+                    conn.last_used.store(os_compat.timestamp(), .release);
                     return conn.socket_fd;
                 }
             }
@@ -73,10 +74,10 @@ pub const ClientRouter = struct {
             if (self.active_connections.load(.acquire) < self.max_connections) {
                 const socket_fd = try self.createConnection(endpoint, auth_secret);
 
-                try self.connections.append(Connection{
+                try self.connections.append(self.allocator, Connection{
                     .socket_fd = socket_fd,
                     .is_connected = std.atomic.Value(bool).init(true),
-                    .last_used = std.atomic.Value(i64).init(std.time.timestamp()),
+                    .last_used = std.atomic.Value(i64).init(os_compat.timestamp()),
                 });
 
                 _ = self.active_connections.fetchAdd(1, .monotonic);
@@ -88,11 +89,11 @@ pub const ClientRouter = struct {
 
         fn createConnection(self: *ConnectionPool, endpoint: *const Endpoint, auth_secret: []const u8) !std.posix.fd_t {
             _ = self;
-            const socket_fd = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
-            errdefer std.posix.close(socket_fd);
+            const socket_fd = try os_compat.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+            errdefer os_compat.close(socket_fd);
 
-            const addr = try std.net.Address.parseIp(endpoint.address, endpoint.port);
-            try std.posix.connect(socket_fd, &addr.any, addr.getOsSockLen());
+            const addr = try os_compat.Address.parseIp(endpoint.address, endpoint.port);
+            try os_compat.connect(socket_fd, &addr.any, addr.getOsSockLen());
 
             // Authenticate with server
             try wire_protocol.WireProtocol.sendAuthRequest(socket_fd, auth_secret);
@@ -107,7 +108,7 @@ pub const ClientRouter = struct {
         pub fn releaseConnection(self: *ConnectionPool, socket_fd: std.posix.fd_t) void {
             for (self.connections.items) |*conn| {
                 if (conn.socket_fd == socket_fd) {
-                    conn.last_used.store(std.time.timestamp(), .release);
+                    conn.last_used.store(os_compat.timestamp(), .release);
                     break;
                 }
             }
@@ -119,7 +120,7 @@ pub const ClientRouter = struct {
                     // Use CAS to atomically transition from connected to disconnected
                     // Only the first thread to successfully CAS will close the socket
                     if (conn.is_connected.cmpxchgWeak(true, false, .acq_rel, .acquire) == null) {
-                        std.posix.close(socket_fd);
+                        os_compat.close(socket_fd);
                         _ = self.active_connections.fetchSub(1, .release);
                     }
                     break;
@@ -170,9 +171,9 @@ pub const ClientRouter = struct {
         }
 
         // Initialize active replicas list
-        var active_replicas = std.ArrayList(u32).init(allocator);
+        var active_replicas = std.ArrayListUnmanaged(u32).empty;
         for (0..replica_endpoints.len) |i| {
-            try active_replicas.append(@intCast(i));
+            try active_replicas.append(allocator, @intCast(i));
         }
 
         return Self{
@@ -204,7 +205,7 @@ pub const ClientRouter = struct {
         }
         self.allocator.free(self.replica_endpoints);
 
-        self.active_replicas.deinit();
+        self.active_replicas.deinit(self.allocator);
     }
 
     // Route read operations to healthy replicas with load balancing
@@ -385,12 +386,12 @@ pub const ClientRouter = struct {
     fn markEndpointUnhealthy(self: *Self, endpoint: *Endpoint) void {
         _ = self;
         endpoint.is_healthy.store(false, .release);
-        endpoint.last_error_time.store(std.time.timestamp(), .release);
+        endpoint.last_error_time.store(os_compat.timestamp(), .release);
         _ = endpoint.consecutive_failures.fetchAdd(1, .monotonic);
     }
 
     fn maybePerformHealthChecks(self: *Self) void {
-        const current_time = std.time.milliTimestamp();
+        const current_time = os_compat.milliTimestamp();
         const last_check = self.last_health_check.load(.acquire);
 
         if (current_time - last_check >= self.health_check_interval_ms) {
@@ -412,7 +413,7 @@ pub const ClientRouter = struct {
             if (self.checkEndpointHealth(endpoint)) {
                 endpoint.is_healthy.store(true, .release);
                 endpoint.consecutive_failures.store(0, .release);
-                self.active_replicas.append(@intCast(i)) catch {};
+                self.active_replicas.append(self.allocator, @intCast(i)) catch {};
             }
         }
     }
@@ -420,21 +421,21 @@ pub const ClientRouter = struct {
     fn checkEndpointHealth(self: *Self, endpoint: *const Endpoint) bool {
         _ = self;
         // Simple TCP connection test
-        const socket_fd = std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0) catch return false;
-        defer std.posix.close(socket_fd);
+        const socket_fd = os_compat.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0) catch return false;
+        defer os_compat.close(socket_fd);
 
-        const addr = std.net.Address.parseIp(endpoint.address, endpoint.port) catch return false;
+        const addr = os_compat.Address.parseIp(endpoint.address, endpoint.port) catch return false;
 
         // Set non-blocking and short timeout
-        const flags = std.posix.fcntl(socket_fd, std.posix.F.GETFL, 0) catch return false;
-        _ = std.posix.fcntl(socket_fd, std.posix.F.SETFL, flags | 0x800) catch return false; // O_NONBLOCK = 0x800
+        const flags = os_compat.fcntl(socket_fd, std.posix.F.GETFL, 0) catch return false;
+        _ = os_compat.fcntl(socket_fd, std.posix.F.SETFL, flags | 0x800) catch return false; // O_NONBLOCK = 0x800
 
         // Attempt connection
-        std.posix.connect(socket_fd, &addr.any, addr.getOsSockLen()) catch |err| {
+        os_compat.connect(socket_fd, &addr.any, addr.getOsSockLen()) catch |err| {
             switch (err) {
                 error.WouldBlock => {
                     // Connection in progress, wait briefly
-                    std.time.sleep(100_000_000); // 100ms
+                    os_compat.sleep(100_000_000); // 100ms
                     return true; // Assume healthy if connection is progressing
                 },
                 else => return false,

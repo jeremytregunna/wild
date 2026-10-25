@@ -20,10 +20,16 @@ pub const flat_hash_storage = @import("flat_hash_storage.zig");
 pub const FlatHashStorage = flat_hash_storage.FlatHashStorage;
 pub const CacheLineRecord = flat_hash_storage.CacheLineRecord;
 
+// Re-export the pieces an end-to-end test needs to start the server and talk
+// to it with the real client.
+pub const wild = @import("wild.zig");
+pub const server = @import("server.zig");
+pub const client = @import("client.zig");
+pub const static_allocator = @import("static_allocator.zig");
+pub const os_compat = @import("os_compat.zig");
+
 test "cache topology analysis" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var topology = analyzeCacheTopology(allocator) catch {
         // If we can't analyze cache topology (e.g., running in CI without /sys/devices),

@@ -52,17 +52,20 @@ pub const SlabAllocator = struct {
         return Self{
             .backing_allocator = backing_allocator,
             .size_classes = size_classes,
-            .allocated_slabs = std.ArrayList(*Slab).init(backing_allocator),
+            .allocated_slabs = .empty,
         };
     }
 
     pub fn deinit(self: *Self) void {
-        // Free all slabs
+        // Free all slabs. createSlab allocates them page-aligned, so each free
+        // must carry the same alignment. A plain free() reports align 1 and the
+        // backing allocator rejects the mismatch.
+        const slab_align = std.mem.Alignment.fromByteUnits(std.heap.page_size_min);
         for (self.allocated_slabs.items) |slab| {
-            self.backing_allocator.free(slab.memory);
+            self.backing_allocator.rawFree(slab.memory, slab_align, @returnAddress());
             self.backing_allocator.destroy(slab);
         }
-        self.allocated_slabs.deinit();
+        self.allocated_slabs.deinit(self.backing_allocator);
     }
 
     pub fn allocator(self: *Self) std.mem.Allocator {
@@ -112,7 +115,7 @@ pub const SlabAllocator = struct {
         }
 
         const slab = try self.backing_allocator.create(Slab);
-        const memory = try self.backing_allocator.alignedAlloc(u8, std.heap.page_size_min, SLAB_SIZE);
+        const memory = try self.backing_allocator.alignedAlloc(u8, .fromByteUnits(std.heap.page_size_min), SLAB_SIZE);
 
         const objects_per_slab = SLAB_SIZE / size_class.object_size;
 
@@ -143,7 +146,7 @@ pub const SlabAllocator = struct {
         size_class.slab_count += 1;
 
         // Track slab for cleanup
-        try self.allocated_slabs.append(slab);
+        try self.allocated_slabs.append(self.backing_allocator, slab);
 
         return slab;
     }

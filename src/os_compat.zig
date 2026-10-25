@@ -1,0 +1,578 @@
+//! Compatibility layer for the POSIX calls that std removed in Zig 0.16/0.17.
+//!
+//! Zig 0.16 moved sockets and files behind the `std.Io` interface. WILD calls
+//! those syscalls directly on purpose: the server uses io_uring, and the WAL
+//! uses O_DIRECT. So this file keeps the raw syscall path. It wraps
+//! `std.os.linux`. It adds no allocation and no extra thread.
+//!
+//! Linux x86-64 only, like the rest of WILD.
+
+const std = @import("std");
+const os_compat = @import("os_compat.zig");
+const linux = std.os.linux;
+const posix = std.posix;
+
+pub const fd_t = posix.fd_t;
+pub const sockaddr = posix.sockaddr;
+pub const socklen_t = posix.socklen_t;
+pub const AF = posix.AF;
+pub const SOCK = posix.SOCK;
+pub const SOL = posix.SOL;
+pub const SO = posix.SO;
+pub const MSG = posix.MSG;
+pub const F = posix.F;
+pub const AT = posix.AT;
+
+/// Errors that the removed `std.posix` socket functions used to return.
+pub const SocketError = error{
+    WouldBlock,
+    NotSocket,
+    PermissionDenied,
+    AddressInUse,
+    AddressUnavailable,
+    NetworkUnreachable,
+    ConnectionResetByPeer,
+    ConnectionRefused,
+    ConnectionAborted,
+    BrokenPipe,
+    AlreadyConnected,
+    FileDescriptorInvalid,
+    ProcessFileDescriptorLimitReached,
+    SystemResources,
+    IsDir,
+    FileNotFound,
+    NameTooLong,
+    NoSpaceLeft,
+    InputOutput,
+    Unexpected,
+};
+
+/// Maps a raw syscall return value to an error, or returns the value.
+fn check(rc: usize) SocketError!usize {
+    switch (posix.errno(rc)) {
+        .SUCCESS => return rc,
+        .INTR => return error.WouldBlock,
+        .AGAIN => return error.WouldBlock,
+        .BADF => return error.FileDescriptorInvalid,
+        .INVAL => return error.Unexpected,
+        .FAULT => return error.Unexpected,
+        .NOMEM => return error.SystemResources,
+        .PERM => return error.PermissionDenied,
+        .ACCES => return error.PermissionDenied,
+        .ADDRINUSE => return error.AddressInUse,
+        .ADDRNOTAVAIL => return error.AddressUnavailable,
+        .ALREADY => return error.AlreadyConnected,
+        .ISCONN => return error.AlreadyConnected,
+        .CONNABORTED => return error.ConnectionAborted,
+        .CONNREFUSED => return error.ConnectionRefused,
+        .CONNRESET => return error.ConnectionResetByPeer,
+        .NOTSOCK => return error.NotSocket,
+        .PIPE => return error.BrokenPipe,
+        .NOBUFS => return error.SystemResources,
+        .NFILE => return error.ProcessFileDescriptorLimitReached,
+        .MFILE => return error.ProcessFileDescriptorLimitReached,
+        .ISDIR => return error.IsDir,
+        .NAMETOOLONG => return error.NameTooLong,
+        .NOENT => return error.FileNotFound,
+        .NOSPC => return error.NoSpaceLeft,
+        .IO => return error.InputOutput,
+        else => return error.Unexpected,
+    }
+}
+
+/// `std.posix.sockaddr_in`, which no longer exists. `std.posix.sockaddr` lost
+/// its `.inet` union, so the IPv4 fields go into `.data` as raw bytes.
+const SockaddrIn = extern struct {
+    family: posix.sa_family_t,
+    port: u16,
+    addr: u32,
+    padding: [8]u8,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(SockaddrIn) == 16);
+}
+
+pub const AddrInfoError = error{
+    InvalidCharacter,
+    NameNotFound,
+};
+
+/// Replacement for the removed `std.net.Address`, covering the IPv4 TCP path
+/// that WILD uses.
+pub const Address = struct {
+    any: sockaddr = std.mem.zeroes(sockaddr),
+
+    pub fn getOsSockLen(self: *const Address) socklen_t {
+        _ = self;
+        return @sizeOf(SockaddrIn);
+    }
+
+    /// Parse a dotted-quad IPv4 literal plus a port. Every WILD call site uses
+    /// an IPv4 literal ("0.0.0.0", a primary address, an endpoint address).
+    pub fn parseIp(text: []const u8, port: u16) AddrInfoError!Address {
+        var self = Address{};
+        const sin = SockaddrIn{
+            .family = posix.AF.INET,
+            .port = std.mem.bigToNative(u16, port),
+            .addr = try parseIpv4(text),
+            .padding = std.mem.zeroes([8]u8),
+        };
+        self.any.family = posix.AF.INET;
+        // sockaddr.data starts where SockaddrIn.port starts, so skip the family.
+        @memcpy(self.any.data[0..14], std.mem.asBytes(&sin)[@sizeOf(posix.sa_family_t)..]);
+        return self;
+    }
+};
+
+/// Parse "1.2.3.4" into a network-byte-order IPv4 address.
+fn parseIpv4(text: []const u8) AddrInfoError!u32 {
+    var octets: [4]u8 = undefined;
+    var count: usize = 0;
+    var rest: []const u8 = text;
+    while (true) {
+        if (count == 4) return error.InvalidCharacter;
+        const dot = std.mem.indexOfScalar(u8, rest, '.');
+        const part = if (dot) |d| rest[0..d] else rest;
+        if (part.len == 0 or part.len > 3) return error.InvalidCharacter;
+        octets[count] = std.fmt.parseInt(u8, part, 10) catch return error.InvalidCharacter;
+        count += 1;
+        if (dot) |d| {
+            rest = rest[d + 1 ..];
+        } else break;
+    }
+    if (count != 4) return error.InvalidCharacter;
+    const host_order: u32 = (@as(u32, octets[0]) << 24) |
+        (@as(u32, octets[1]) << 16) |
+        (@as(u32, octets[2]) << 8) |
+        @as(u32, octets[3]);
+    return std.mem.bigToNative(u32, host_order);
+}
+
+pub fn socket(domain: u32, socket_type: u32, protocol: u32) SocketError!fd_t {
+    const rc = try check(linux.socket(domain, socket_type, protocol));
+    return @intCast(rc);
+}
+
+pub fn bind(fd: fd_t, addr: *const sockaddr, addrlen: socklen_t) SocketError!void {
+    _ = try check(linux.bind(fd, addr, addrlen));
+}
+
+pub fn listen(fd: fd_t, backlog: u32) SocketError!void {
+    _ = try check(linux.listen(fd, backlog));
+}
+
+pub fn connect(fd: fd_t, addr: *const sockaddr, addrlen: socklen_t) SocketError!void {
+    _ = try check(linux.connect(fd, addr, addrlen));
+}
+
+/// `std.posix.send` was removed. `send(2)` with no address equals `sendto(2)`.
+pub fn send(fd: fd_t, buf: []const u8, flags: u32) SocketError!usize {
+    if (buf.len == 0) return 0;
+    return check(linux.sendto(fd, buf.ptr, buf.len, flags, null, 0));
+}
+
+/// `std.posix.recv` was removed. `recv(2)` with no address equals `recvfrom(2)`.
+pub fn recv(fd: fd_t, buf: []u8, flags: u32) SocketError!usize {
+    if (buf.len == 0) return 0;
+    var addr_len: socklen_t = 0;
+    return check(linux.recvfrom(fd, buf.ptr, buf.len, flags, null, &addr_len));
+}
+
+/// `std.posix.accept` took `SOCK.NONBLOCK` in the flags argument. `accept4(2)`
+/// uses the same bits, so the value passes straight through.
+pub fn accept(fd: fd_t, addr: ?*sockaddr, addr_len: ?*socklen_t, flags: u32) SocketError!fd_t {
+    const rc = try check(linux.accept4(fd, addr, addr_len, flags));
+    return @intCast(rc);
+}
+
+pub fn setsockoptReuse(fd: fd_t) SocketError!void {
+    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1))) catch
+        return error.Unexpected;
+}
+
+/// Send every byte, retrying on partial writes.
+pub fn sendAllCompat(fd: fd_t, buf: []const u8) SocketError!void {
+    var total: usize = 0;
+    while (total < buf.len) {
+        total += try send(fd, buf[total..], 0);
+    }
+}
+
+pub fn close(fd: fd_t) void {
+    _ = linux.close(fd);
+}
+
+pub fn write(fd: fd_t, buf: []const u8) SocketError!usize {
+    if (buf.len == 0) return 0;
+    return check(linux.write(fd, buf.ptr, buf.len));
+}
+
+pub fn read(fd: fd_t, buf: []u8) SocketError!usize {
+    if (buf.len == 0) return 0;
+    return check(linux.read(fd, buf.ptr, buf.len));
+}
+
+pub fn fsync(fd: fd_t) SocketError!void {
+    _ = try check(linux.fsync(fd));
+}
+
+pub fn fdatasync(fd: fd_t) SocketError!void {
+    _ = try check(linux.fdatasync(fd));
+}
+
+pub fn fcntl(fd: fd_t, cmd: u32, arg: usize) SocketError!usize {
+    return check(linux.fcntl(fd, @intCast(cmd), arg));
+}
+
+pub fn unlink(path: []const u8) SocketError!void {
+    _ = try check(linux.unlink(@ptrCast(path.ptr)));
+}
+
+// ---------------------------------------------------------------------------
+// Time and sleep
+//
+// Zig 0.16 removed `std.time.nanoTimestamp`, `std.time.milliTimestamp`,
+// `std.time.timestamp`, and `std.Thread.sleep`. Their replacements are
+// `std.Io.Clock.now(io)` and `io.sleep(...)`, which need an `std.Io` instance.
+// WILD calls these on the write path and in spin-wait backoff loops, so these
+// wrappers keep the direct `clock_gettime`/`nanosleep` syscalls instead.
+// ---------------------------------------------------------------------------
+
+/// Same units and sign as the removed `std.time.nanoTimestamp`.
+pub fn nanoTimestamp() i128 {
+    const ts = now(linux.clockid_t.MONOTONIC);
+    return @as(i128, ts.sec) * std.time.ns_per_s + @as(i128, ts.nsec);
+}
+
+/// Same units and sign as the removed `std.time.milliTimestamp`.
+pub fn milliTimestamp() i64 {
+    const ts = now(linux.clockid_t.MONOTONIC);
+    return @as(i64, ts.sec) * std.time.ms_per_s + @divTrunc(@as(i64, ts.nsec), std.time.ns_per_ms);
+}
+
+/// Same units and sign as the removed `std.time.timestamp` (wall clock seconds).
+pub fn timestamp() i64 {
+    return @as(i64, now(linux.clockid_t.REALTIME).sec);
+}
+
+fn now(clock: linux.clockid_t) posix.timespec {
+    var ts: posix.timespec = undefined;
+    const rc = linux.clock_gettime(clock, &ts);
+    switch (posix.errno(rc)) {
+        .SUCCESS => return ts,
+        // A clock reading failure is a kernel bug on the supported target.
+        else => @panic("clock_gettime failed"),
+    }
+}
+
+/// Replacement for the removed `std.Thread.sleep`. Takes nanoseconds, like the
+/// removed function.
+pub fn sleep(nanoseconds: u64) void {
+    var req = posix.timespec{
+        .sec = @intCast(nanoseconds / std.time.ns_per_s),
+        .nsec = @intCast(nanoseconds % std.time.ns_per_s),
+    };
+    while (true) {
+        var rem: posix.timespec = undefined;
+        const rc = linux.nanosleep(&req, &rem);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return,
+            .INTR => req = rem, // interrupted, sleep the remainder
+            else => return,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mutex
+//
+// `os_compat.Mutex` was removed; `std.Io.Mutex` is the replacement, but
+// `lock`/`unlock` take an `std.Io`. The WAL keeps locks in structs that have no
+// `std.Io`, so this mirrors `std.Io.Mutex` with the same futex calls and the
+// same no-argument signatures.
+// ---------------------------------------------------------------------------
+
+pub const Mutex = struct {
+    state: std.atomic.Value(State) = .init(.unlocked),
+
+    pub const State = enum(u32) {
+        unlocked,
+        locked_once,
+        contended,
+    };
+
+    pub fn tryLock(m: *Mutex) bool {
+        return m.state.cmpxchgStrong(.unlocked, .locked_once, .acquire, .monotonic) == null;
+    }
+
+    pub fn lock(m: *Mutex) void {
+        if (m.state.cmpxchgStrong(.unlocked, .locked_once, .acquire, .monotonic) == null) {
+            @branchHint(.likely);
+            return;
+        }
+        while (true) {
+            if (m.state.swap(.contended, .acquire) == .unlocked) return;
+            m.futexWait(.contended);
+        }
+    }
+
+    pub fn unlock(m: *Mutex) void {
+        switch (m.state.swap(.unlocked, .release)) {
+            .unlocked => unreachable,
+            .locked_once => {},
+            .contended => m.futexWake(1),
+        }
+    }
+
+    fn futexWait(m: *Mutex, expected: State) void {
+        const ptr: *align(4) const u32 = @ptrCast(&m.state.raw);
+        _ = linux.futex_3arg(ptr, .{ .cmd = .WAIT, .private = true }, @backingInt(expected));
+    }
+
+    fn futexWake(m: *Mutex, max_waiters: u32) void {
+        if (max_waiters == 0) return;
+        const ptr: *align(4) const u32 = @ptrCast(&m.state.raw);
+        _ = linux.futex_3arg(
+            ptr,
+            .{ .cmd = .WAKE, .private = true },
+            @min(max_waiters, std.math.maxInt(i32)),
+        );
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Files and directories
+//
+// Zig 0.16 removed `os_compat.File`, `std.fs.Dir`, and `std.fs.cwd()`. The
+// replacements are `std.Io.File` and `std.Io.Dir`, and every method takes an
+// `std.Io`. Snapshots and WAL recovery have no `std.Io` to pass, so these
+// wrappers keep the old signatures over direct syscalls.
+//
+// Paths must be NUL-terminated, like `std.posix.openat`.
+// ---------------------------------------------------------------------------
+
+pub const FileError = error{
+    FileNotFound,
+    AccessDenied,
+    NameTooLong,
+    NotDir,
+    IsDir,
+    DirNotEmpty,
+    PathAlreadyExists,
+    NoSpaceLeft,
+    InputOutput,
+    Unexpected,
+};
+
+fn fileCheck(rc: usize) FileError!usize {
+    switch (posix.errno(rc)) {
+        .SUCCESS => return rc,
+        .NOENT => return error.FileNotFound,
+        .ACCES => return error.AccessDenied,
+        .PERM => return error.AccessDenied,
+        .NAMETOOLONG => return error.NameTooLong,
+        .NOTDIR => return error.NotDir,
+        .ISDIR => return error.IsDir,
+        .NOTEMPTY => return error.DirNotEmpty,
+        .EXIST => return error.PathAlreadyExists,
+        .NOSPC => return error.NoSpaceLeft,
+        .IO => return error.InputOutput,
+        .BADF => return error.FileNotFound,
+        .INTR => return error.InputOutput,
+        else => return error.Unexpected,
+    }
+}
+
+pub const Mode = enum { read_only, write_only, read_write };
+
+pub const FileOpenOptions = struct {
+    /// For `openFile`.
+    mode: Mode = .read_write,
+    /// For `createFile`: open for reading as well as writing.
+    read: bool = false,
+    /// For `createFile`: truncate an existing file to zero length.
+    truncate: bool = true,
+};
+
+pub const File = struct {
+    handle: posix.fd_t,
+
+    pub fn read(self: File, buffer: []u8) FileError!usize {
+        if (buffer.len == 0) return 0;
+        return fileCheck(linux.read(self.handle, buffer.ptr, buffer.len));
+    }
+
+    /// Same contract as the removed `os_compat.File.readAll`: returns bytes read,
+    /// fewer than buffer.len only at end of file.
+    pub fn readAll(self: File, buffer: []u8) FileError!usize {
+        var total: usize = 0;
+        while (total < buffer.len) {
+            const n = try self.read(buffer[total..]);
+            if (n == 0) break; // end of file
+            total += n;
+        }
+        return total;
+    }
+
+    pub fn write(self: File, buffer: []const u8) FileError!usize {
+        if (buffer.len == 0) return 0;
+        return fileCheck(linux.write(self.handle, buffer.ptr, buffer.len));
+    }
+
+    pub fn writeAll(self: File, buffer: []const u8) FileError!void {
+        var total: usize = 0;
+        while (total < buffer.len) {
+            total += try self.write(buffer[total..]);
+        }
+    }
+
+    pub fn seekTo(self: File, offset: u64) FileError!void {
+        _ = try fileCheck(linux.lseek(self.handle, @bitCast(@as(isize, @bitCast(offset))), linux.SEEK.SET));
+    }
+
+    /// Same contract as the removed `std.fs.File.getEndPos`. Restores the file
+    /// offset, so callers can interleave reads.
+    pub fn getEndPos(self: File) FileError!u64 {
+        const current = try fileCheck(linux.lseek(self.handle, 0, linux.SEEK.CUR));
+        const size = try fileCheck(linux.lseek(self.handle, 0, linux.SEEK.END));
+        _ = try fileCheck(linux.lseek(
+            self.handle,
+            @bitCast(@as(isize, @bitCast(current))),
+            linux.SEEK.SET,
+        ));
+        return size;
+    }
+
+    pub fn setEndPos(self: File, new_size: u64) FileError!void {
+        _ = try fileCheck(linux.ftruncate(self.handle, @bitCast(@as(i64, @bitCast(new_size)))));
+    }
+
+    pub fn sync(self: File) FileError!void {
+        _ = try fileCheck(linux.fsync(self.handle));
+    }
+
+    pub fn datasync(self: File) FileError!void {
+        _ = try fileCheck(linux.fdatasync(self.handle));
+    }
+
+    pub fn close(self: File) void {
+        _ = linux.close(self.handle);
+    }
+};
+
+fn openFlags(opts: FileOpenOptions, create: bool) linux.O {
+    var flags = linux.O{ .ACCMODE = switch (opts.mode) {
+        .read_only => .RDONLY,
+        .write_only => .WRONLY,
+        .read_write => .RDWR,
+    } };
+    if (create) {
+        flags.CREAT = true;
+        flags.TRUNC = opts.truncate;
+    }
+    return flags;
+}
+
+/// Replacement for `os_compat.openFile(path, .{ .mode = ... })`.
+pub fn openFile(path: []const u8, opts: FileOpenOptions) FileError!File {
+    return openFileAt(path, opts, false);
+}
+
+/// Replacement for `os_compat.createFile(path, .{ ... })`.
+pub fn createFile(path: []const u8, opts: FileOpenOptions) FileError!File {
+    return openFileAt(path, opts, true);
+}
+
+fn openFileAt(path: []const u8, opts: FileOpenOptions, create: bool) FileError!File {
+    const rc = linux.openat(
+        linux.AT.FDCWD,
+        @ptrCast(path.ptr),
+        openFlags(opts, create),
+        0o644,
+    );
+    return .{ .handle = @intCast(try fileCheck(rc)) };
+}
+
+/// Replacement for `os_compat.deleteFile(path)`.
+pub fn deleteFile(path: []const u8) FileError!void {
+    _ = try fileCheck(linux.unlinkat(linux.AT.FDCWD, @ptrCast(path.ptr), 0));
+}
+
+/// Replacement for `os_compat.makeDir(path)`.
+pub fn makeDir(path: []const u8) FileError!void {
+    _ = try fileCheck(linux.mkdirat(linux.AT.FDCWD, @ptrCast(path.ptr), 0o755));
+}
+
+pub const Kind = enum { file, directory, unknown };
+
+pub const DirEntry = struct {
+    name: []const u8,
+    kind: Kind,
+};
+
+pub const Dir = struct {
+    handle: posix.fd_t,
+    buffer: [8192]u8 align(@alignOf(linux.dirent64)) = undefined,
+    buffer_len: usize = 0,
+    buffer_pos: usize = 0,
+
+    pub fn close(self: *Dir) void {
+        _ = linux.close(self.handle);
+        self.* = undefined;
+    }
+
+    pub fn iterate(self: *Dir) Iterator {
+        return .{ .dir = self };
+    }
+
+    /// Replacement for `std.fs.Dir.deleteFile`. `path` must be NUL-terminated.
+    pub fn deleteFile(self: *Dir, path: []const u8) FileError!void {
+        _ = try fileCheck(linux.unlinkat(self.handle, @ptrCast(path.ptr), 0));
+    }
+
+    pub const Iterator = struct {
+        dir: *Dir,
+
+        pub fn next(it: *Iterator) FileError!?DirEntry {
+            if (it.dir.buffer_pos >= it.dir.buffer_len) {
+                const rc = linux.getdents64(
+                    it.dir.handle,
+                    @ptrCast(&it.dir.buffer),
+                    it.dir.buffer.len,
+                );
+                const n = try fileCheck(rc);
+                if (n == 0) return null; // end of directory
+                it.dir.buffer_len = n;
+                it.dir.buffer_pos = 0;
+            }
+            const base: [*]u8 = @ptrCast(&it.dir.buffer);
+            const aligned: [*]align(@alignOf(linux.dirent64)) const u8 = @alignCast(base + it.dir.buffer_pos);
+            const dirent: *const linux.dirent64 = @ptrCast(aligned);
+            const name: [*:0]const u8 = @ptrCast(&dirent.name);
+            const name_slice = std.mem.span(name);
+            const entry = DirEntry{
+                .name = name_slice,
+                .kind = switch (dirent.type) {
+                    linux.DT.REG => .file,
+                    linux.DT.DIR => .directory,
+                    else => .unknown,
+                },
+            };
+            it.dir.buffer_pos += dirent.reclen;
+            return entry;
+        }
+    };
+};
+
+pub const OpenDirOptions = struct {
+    /// Only `true` is supported: the returned `Dir` can be iterated.
+    iterate: bool = false,
+};
+
+/// Replacement for `std.fs.cwd().openDir(path, .{ .iterate = true })`.
+pub fn openDir(path: []const u8, opts: OpenDirOptions) FileError!Dir {
+    if (!opts.iterate) @panic("os_compat.openDir supports only .iterate = true");
+    const rc = linux.openat(linux.AT.FDCWD, @ptrCast(path.ptr), .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
+    return .{ .handle = @intCast(try fileCheck(rc)) };
+}

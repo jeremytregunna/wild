@@ -1,16 +1,16 @@
 const std = @import("std");
+const os_compat = @import("src/os_compat.zig");
 const client_router = @import("src/client_router.zig");
 
 // Example client application using the WILD client router
 // Demonstrates load-balanced reads across replicas with failover
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     const allocator = std.heap.page_allocator;
     
     // Parse command line arguments
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
-    
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
+        
     if (args.len < 2) {
         std.debug.print("Usage: {s} <command> [args...]\n", .{args[0]});
         std.debug.print("Commands:\n", .{});
@@ -77,7 +77,7 @@ fn runLoadBalancingDemo(allocator: std.mem.Allocator) !void {
         }
         
         // Small delay between operations
-        std.time.sleep(100_000_000); // 100ms
+        os_compat.sleep(100_000_000); // 100ms
     }
     
     std.debug.print("\n", .{});
@@ -107,7 +107,7 @@ fn runLoadBalancingDemo(allocator: std.mem.Allocator) !void {
         };
         
         std.debug.print("success\n", .{});
-        std.time.sleep(50_000_000); // 50ms
+        os_compat.sleep(50_000_000); // 50ms
     }
     
     std.debug.print("\nDemo complete! 🎉\n", .{});

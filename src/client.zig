@@ -1,4 +1,5 @@
 const std = @import("std");
+const os_compat = @import("os_compat.zig");
 
 // WILD client protocol implementation
 const Operation = enum(u8) {
@@ -39,19 +40,34 @@ pub const WildClient = struct {
 
     pub fn connect(self: *Self) !void {
         // Create socket
-        self.socket_fd = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+        self.socket_fd = try os_compat.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
 
         // Parse server address
-        const addr = try std.net.Address.parseIp(self.server_address, self.server_port);
+        const addr = try os_compat.Address.parseIp(self.server_address, self.server_port);
 
         // Connect to server
-        try std.posix.connect(self.socket_fd, &addr.any, addr.getOsSockLen());
+        try os_compat.connect(self.socket_fd, &addr.any, addr.getOsSockLen());
     }
 
     pub fn disconnect(self: *Self) void {
         if (self.socket_fd != 0) {
-            std.posix.close(self.socket_fd);
+            os_compat.close(self.socket_fd);
             self.socket_fd = 0;
+        }
+    }
+
+    /// Send the auth secret. The server reads the first message on a connection
+    /// as the secret, and answers with one byte. An empty secret means the
+    /// server runs without authentication, so nothing is sent.
+    pub fn authenticate(self: *Self, auth_secret: []const u8) !void {
+        if (auth_secret.len == 0) return;
+
+        _ = try os_compat.write(self.socket_fd, auth_secret);
+
+        var reply: [1]u8 = undefined;
+        const read = try std.posix.read(self.socket_fd, &reply);
+        if (read != 1 or reply[0] != @backingInt(Response.ok)) {
+            return error.AuthFailed;
         }
     }
 
@@ -80,13 +96,13 @@ pub const WildClient = struct {
         const message_len = @sizeOf(MessageHeader) + key.len + value.len;
 
         // Send message
-        _ = try std.posix.write(self.socket_fd, message_buffer[0..message_len]);
+        _ = try os_compat.write(self.socket_fd, message_buffer[0..message_len]);
 
         // Read response
         var response_buffer: [1]u8 = undefined;
         _ = try std.posix.read(self.socket_fd, &response_buffer);
 
-        const response: Response = @enumFromInt(response_buffer[0]);
+        const response: Response = @fromBackingInt(@intCast(response_buffer[0]));
         switch (response) {
             .ok => return,
             .err => return error.ServerError,
@@ -114,7 +130,7 @@ pub const WildClient = struct {
         const message_len = @sizeOf(MessageHeader) + key.len;
 
         // Send message
-        _ = try std.posix.write(self.socket_fd, message_buffer[0..message_len]);
+        _ = try os_compat.write(self.socket_fd, message_buffer[0..message_len]);
 
         // Read response header
         var response_header: [2]u8 = undefined;
@@ -124,7 +140,7 @@ pub const WildClient = struct {
             return error.InvalidResponse;
         }
 
-        const response: Response = @enumFromInt(response_header[0]);
+        const response: Response = @fromBackingInt(@intCast(response_header[0]));
         switch (response) {
             .ok => {
                 if (bytes_read < 2) {
@@ -165,13 +181,13 @@ pub const WildClient = struct {
         const message_len = @sizeOf(MessageHeader) + key.len;
 
         // Send message
-        _ = try std.posix.write(self.socket_fd, message_buffer[0..message_len]);
+        _ = try os_compat.write(self.socket_fd, message_buffer[0..message_len]);
 
         // Read response
         var response_buffer: [1]u8 = undefined;
         _ = try std.posix.read(self.socket_fd, &response_buffer);
 
-        const response: Response = @enumFromInt(response_buffer[0]);
+        const response: Response = @fromBackingInt(@intCast(response_buffer[0]));
         switch (response) {
             .ok => return true,
             .not_found => return false,
@@ -182,101 +198,154 @@ pub const WildClient = struct {
 
 fn printUsage() void {
     std.debug.print("WILD Client\n", .{});
-    std.debug.print("Usage: wild-client <server:port> <command> [args...]\n\n", .{});
+    std.debug.print("Usage: wild-client [--auth-secret SECRET] <server:port> <command> [args...]\n\n", .{});
     std.debug.print("Commands:\n", .{});
     std.debug.print("  set <key> <value>  - Store a key-value pair\n", .{});
     std.debug.print("  get <key>          - Retrieve value for key\n", .{});
     std.debug.print("  delete <key>       - Delete key-value pair\n", .{});
+    std.debug.print("\nOptions:\n", .{});
+    std.debug.print("  --auth-secret SECRET  Secret the server was started with.\n", .{});
+    std.debug.print("                        Reads WILD_AUTH_SECRET if omitted.\n", .{});
+    std.debug.print("                        Omit it when the server has no secret.\n", .{});
+    std.debug.print("\nOutput:\n", .{});
+    std.debug.print("  The value from get goes to stdout. Everything else goes\n", .{});
+    std.debug.print("  to stderr, so `wild-client ... get k > file` holds only the value.\n", .{});
+    std.debug.print("\nExit status:\n", .{});
+    std.debug.print("  0 success   1 request failed   2 bad usage\n", .{});
     std.debug.print("\nExamples:\n", .{});
-    std.debug.print("  wild-client 127.0.0.1:9999 set name 'John Doe'\n", .{});
-    std.debug.print("  wild-client 127.0.0.1:9999 get name\n", .{});
-    std.debug.print("  wild-client 127.0.0.1:9999 delete name\n", .{});
+    std.debug.print("  wild-client 127.0.0.1:7878 set name 'John Doe'\n", .{});
+    std.debug.print("  wild-client 127.0.0.1:7878 get name\n", .{});
+    std.debug.print("  wild-client --auth-secret s3cret 127.0.0.1:7878 delete name\n", .{});
 }
 
-pub fn main() !void {
+/// Report a failure and leave nonzero, so a script can tell success from error.
+fn fail(comptime fmt: []const u8, args: anytype) noreturn {
+    std.debug.print(fmt, args);
+    std.process.exit(1);
+}
+
+/// Write data to stdout. Values from `get` belong there, so they can be piped
+/// or redirected. Diagnostics stay on stderr, where std.debug.print sends them.
+fn printStdout(io: std.Io, text: []const u8) void {
+    std.Io.File.stdout().writeStreamingAll(io, text) catch {
+        // A closed pipe, as with `... | head`, is not a client failure.
+    };
+}
+
+fn usageFail() noreturn {
+    printUsage();
+    std.process.exit(2);
+}
+
+pub fn main(init: std.process.Init) !void {
     const allocator = std.heap.page_allocator;
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
 
-    if (args.len < 3) {
-        printUsage();
-        return;
+    // --auth-secret is accepted anywhere. WILD_AUTH_SECRET is the fallback, so
+    // the secret need not appear in the process list or shell history.
+    var auth_secret: []const u8 = "";
+    var positional: std.ArrayList([]const u8) = .empty;
+
+    var i: usize = 1; // args[0] is the program name
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--auth-secret")) {
+            if (i + 1 >= args.len) {
+                std.debug.print("Error: --auth-secret needs a value\n", .{});
+                usageFail();
+            }
+            auth_secret = args[i + 1];
+            i += 1;
+            continue;
+        }
+        try positional.append(allocator, arg);
+    }
+    defer positional.deinit(allocator);
+
+    if (auth_secret.len == 0) {
+        auth_secret = init.environ_map.get("WILD_AUTH_SECRET") orelse "";
+    }
+
+    const params = positional.items;
+    if (params.len < 2) {
+        usageFail();
     }
 
     // Parse server address
-    const server_arg = args[1];
+    const server_arg = params[0];
     const colon_pos = std.mem.lastIndexOf(u8, server_arg, ":") orelse {
         std.debug.print("Error: Server address must be in format address:port\n", .{});
-        return;
+        usageFail();
     };
 
     const server_address = server_arg[0..colon_pos];
     const port_str = server_arg[colon_pos + 1 ..];
     const server_port = std.fmt.parseInt(u16, port_str, 10) catch {
         std.debug.print("Error: Invalid port number: {s}\n", .{port_str});
-        return;
+        usageFail();
     };
 
     // Parse command
-    const command = args[2];
+    const command = params[1];
 
     // Create and connect client
     var client = try WildClient.init(server_address, server_port);
     client.connect() catch |err| {
-        std.debug.print("Error connecting to server {s}:{}: {}\n", .{ server_address, server_port, err });
-        return;
+        fail("Error connecting to server {s}:{}: {}\n", .{ server_address, server_port, err });
     };
     defer client.disconnect();
 
+    client.authenticate(auth_secret) catch |err| {
+        fail("Error authenticating with {s}:{}: {}\n", .{ server_address, server_port, err });
+    };
+
     if (std.mem.eql(u8, command, "set")) {
-        if (args.len != 5) {
+        if (params.len != 4) {
             std.debug.print("Error: set command requires key and value\n", .{});
             std.debug.print("Usage: wild-client <server:port> set <key> <value>\n", .{});
-            return;
+            usageFail();
         }
 
-        const key = args[3];
-        const value = args[4];
+        const key = params[2];
+        const value = params[3];
 
         client.set(key, value) catch |err| {
-            std.debug.print("Error setting key: {}\n", .{err});
-            return;
+            fail("Error setting key: {}\n", .{err});
         };
 
         std.debug.print("OK\n", .{});
     } else if (std.mem.eql(u8, command, "get")) {
-        if (args.len != 4) {
+        if (params.len != 3) {
             std.debug.print("Error: get command requires key\n", .{});
             std.debug.print("Usage: wild-client <server:port> get <key>\n", .{});
-            return;
+            usageFail();
         }
 
-        const key = args[3];
+        const key = params[2];
 
         const result = client.get(key, allocator) catch |err| {
-            std.debug.print("Error getting key: {}\n", .{err});
-            return;
+            fail("Error getting key: {}\n", .{err});
         };
 
         if (result) |value| {
             defer allocator.free(value);
-            std.debug.print("{s}\n", .{value});
+            printStdout(init.io, value);
+            printStdout(init.io, "\n");
         } else {
             std.debug.print("(nil)\n", .{});
         }
     } else if (std.mem.eql(u8, command, "delete")) {
-        if (args.len != 4) {
+        if (params.len != 3) {
             std.debug.print("Error: delete command requires key\n", .{});
             std.debug.print("Usage: wild-client <server:port> delete <key>\n", .{});
-            return;
+            usageFail();
         }
 
-        const key = args[3];
+        const key = params[2];
 
         const deleted = client.delete(key) catch |err| {
-            std.debug.print("Error deleting key: {}\n", .{err});
-            return;
+            fail("Error deleting key: {}\n", .{err});
         };
 
         if (deleted) {
@@ -286,6 +355,6 @@ pub fn main() !void {
         }
     } else {
         std.debug.print("Error: Unknown command '{s}'\n", .{command});
-        printUsage();
+        usageFail();
     }
 }

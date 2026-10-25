@@ -46,7 +46,7 @@ fn printUsage(program_name: []const u8) void {
     std.debug.print("  {s} --mode replica --primary-address 192.168.1.100 --primary-port 9001 --auth-secret mysecret\n\n", .{program_name});
 }
 
-fn parseArguments(allocator: std.mem.Allocator, args: [][:0]u8) !CommandLineArgs {
+fn parseArguments(allocator: std.mem.Allocator, args: []const [:0]const u8) !CommandLineArgs {
     var parsed_args = CommandLineArgs{};
 
     var i: usize = 1; // Skip program name
@@ -129,12 +129,11 @@ fn buildDaemonConfig(args: CommandLineArgs) daemon.WildDaemon.DaemonConfig {
     };
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     const allocator = std.heap.page_allocator;
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
-
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    
     if (args.len < 1) {
         printUsage("wild");
         return;

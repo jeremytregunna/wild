@@ -1,4 +1,5 @@
 const std = @import("std");
+const os_compat = @import("os_compat.zig");
 
 // Space-optimized wire protocol for WILD database client-server communication
 // Uses bit-packed header for efficient field encoding
@@ -40,9 +41,9 @@ pub const WireMessage = extern struct {
     };
 
     pub fn init(msg_type: MessageType, key: u64, data_length: u32, status: Status) WireMessage {
-        const packed_value = (@as(u32, @intFromEnum(msg_type)) << MESSAGE_TYPE_SHIFT) |
+        const packed_value = (@as(u32, @backingInt(msg_type)) << MESSAGE_TYPE_SHIFT) |
             (@as(u32, data_length) << DATA_LENGTH_SHIFT) |
-            (@as(u32, @intFromEnum(status)) << STATUS_SHIFT);
+            (@as(u32, @backingInt(status)) << STATUS_SHIFT);
 
         return WireMessage{
             .packed_fields = packed_value,
@@ -52,7 +53,7 @@ pub const WireMessage = extern struct {
 
     pub fn getMessageType(self: *const WireMessage) MessageType {
         const value = (self.packed_fields & MESSAGE_TYPE_MASK) >> MESSAGE_TYPE_SHIFT;
-        return @enumFromInt(value);
+        return @fromBackingInt(@intCast(value));
     }
 
     pub fn getDataLength(self: *const WireMessage) u32 {
@@ -61,12 +62,12 @@ pub const WireMessage = extern struct {
 
     pub fn getStatus(self: *const WireMessage) Status {
         const value = (self.packed_fields & STATUS_MASK) >> STATUS_SHIFT;
-        return @enumFromInt(value);
+        return @fromBackingInt(@intCast(value));
     }
 
     pub fn setStatus(self: *WireMessage, status: Status) void {
         self.packed_fields = (self.packed_fields & ~STATUS_MASK) |
-            (@as(u32, @intFromEnum(status)) << STATUS_SHIFT);
+            (@as(u32, @backingInt(status)) << STATUS_SHIFT);
     }
 };
 
@@ -89,14 +90,14 @@ pub const WireProtocol = struct {
         const message = WireMessage.init(.auth_request, 0, @intCast(auth_secret.len), .success);
 
         // Send header
-        var bytes_sent = try std.posix.send(socket_fd, std.mem.asBytes(&message), 0);
+        var bytes_sent = try os_compat.send(socket_fd, std.mem.asBytes(&message), 0);
         if (bytes_sent != HEADER_SIZE) {
             return error.IncompleteWrite;
         }
 
         // Send auth secret
         if (auth_secret.len > 0) {
-            bytes_sent = try std.posix.send(socket_fd, auth_secret, 0);
+            bytes_sent = try os_compat.send(socket_fd, auth_secret, 0);
             if (bytes_sent != auth_secret.len) {
                 return error.IncompleteWrite;
             }
@@ -107,7 +108,7 @@ pub const WireProtocol = struct {
         const status: WireMessage.Status = if (success) .success else .error_auth_failed;
         const message = WireMessage.init(.auth_response, 0, 0, status);
 
-        const bytes_sent = try std.posix.send(socket_fd, std.mem.asBytes(&message), 0);
+        const bytes_sent = try os_compat.send(socket_fd, std.mem.asBytes(&message), 0);
         if (bytes_sent != HEADER_SIZE) {
             return error.IncompleteWrite;
         }
@@ -116,7 +117,7 @@ pub const WireProtocol = struct {
     pub fn receiveAuthRequest(socket_fd: std.posix.fd_t, allocator: std.mem.Allocator) ![]u8 {
         // Receive header
         var header_bytes: [HEADER_SIZE]u8 = undefined;
-        const header_received = try std.posix.recv(socket_fd, &header_bytes, 0);
+        const header_received = try os_compat.recv(socket_fd, &header_bytes, 0);
         if (header_received != HEADER_SIZE) {
             return error.IncompleteRead;
         }
@@ -135,7 +136,7 @@ pub const WireProtocol = struct {
         // Receive auth secret
         if (data_length > 0) {
             const auth_secret = try allocator.alloc(u8, data_length);
-            const data_received = try std.posix.recv(socket_fd, auth_secret, 0);
+            const data_received = try os_compat.recv(socket_fd, auth_secret, 0);
             if (data_received != data_length) {
                 allocator.free(auth_secret);
                 return error.IncompleteRead;
@@ -148,7 +149,7 @@ pub const WireProtocol = struct {
 
     pub fn receiveAuthResponse(socket_fd: std.posix.fd_t) !bool {
         var header_bytes: [HEADER_SIZE]u8 = undefined;
-        const header_received = try std.posix.recv(socket_fd, &header_bytes, 0);
+        const header_received = try os_compat.recv(socket_fd, &header_bytes, 0);
         if (header_received != HEADER_SIZE) {
             return error.IncompleteRead;
         }
@@ -164,7 +165,7 @@ pub const WireProtocol = struct {
 
     pub fn sendReadRequest(socket_fd: std.posix.fd_t, key: u64) !void {
         const message = WireMessage.init(.read_request, key, 0, .success);
-        const bytes_sent = try std.posix.send(socket_fd, std.mem.asBytes(&message), 0);
+        const bytes_sent = try os_compat.send(socket_fd, std.mem.asBytes(&message), 0);
         if (bytes_sent != HEADER_SIZE) {
             return error.IncompleteWrite;
         }
@@ -178,14 +179,14 @@ pub const WireProtocol = struct {
         const message = WireMessage.init(.write_request, key, @intCast(data.len), .success);
 
         // Send header
-        var bytes_sent = try std.posix.send(socket_fd, std.mem.asBytes(&message), 0);
+        var bytes_sent = try os_compat.send(socket_fd, std.mem.asBytes(&message), 0);
         if (bytes_sent != HEADER_SIZE) {
             return error.IncompleteWrite;
         }
 
         // Send data if any
         if (data.len > 0) {
-            bytes_sent = try std.posix.send(socket_fd, data, 0);
+            bytes_sent = try os_compat.send(socket_fd, data, 0);
             if (bytes_sent != data.len) {
                 return error.IncompleteWrite;
             }
@@ -194,7 +195,7 @@ pub const WireProtocol = struct {
 
     pub fn sendDeleteRequest(socket_fd: std.posix.fd_t, key: u64) !void {
         const message = WireMessage.init(.delete_request, key, 0, .success);
-        const bytes_sent = try std.posix.send(socket_fd, std.mem.asBytes(&message), 0);
+        const bytes_sent = try os_compat.send(socket_fd, std.mem.asBytes(&message), 0);
         if (bytes_sent != HEADER_SIZE) {
             return error.IncompleteWrite;
         }
@@ -207,14 +208,14 @@ pub const WireProtocol = struct {
         const message = WireMessage.init(.read_response, key, data_len, status);
 
         // Send header
-        var bytes_sent = try std.posix.send(socket_fd, std.mem.asBytes(&message), 0);
+        var bytes_sent = try os_compat.send(socket_fd, std.mem.asBytes(&message), 0);
         if (bytes_sent != HEADER_SIZE) {
             return error.IncompleteWrite;
         }
 
         // Send data if found
         if (data) |d| {
-            bytes_sent = try std.posix.send(socket_fd, d, 0);
+            bytes_sent = try os_compat.send(socket_fd, d, 0);
             if (bytes_sent != d.len) {
                 return error.IncompleteWrite;
             }
@@ -225,7 +226,7 @@ pub const WireProtocol = struct {
         const status: WireMessage.Status = if (success) .success else .error_internal;
         const message = WireMessage.init(.write_response, key, 0, status);
 
-        const bytes_sent = try std.posix.send(socket_fd, std.mem.asBytes(&message), 0);
+        const bytes_sent = try os_compat.send(socket_fd, std.mem.asBytes(&message), 0);
         if (bytes_sent != HEADER_SIZE) {
             return error.IncompleteWrite;
         }
@@ -235,7 +236,7 @@ pub const WireProtocol = struct {
         const status: WireMessage.Status = if (deleted) .success else .not_found;
         const message = WireMessage.init(.delete_response, key, 0, status);
 
-        const bytes_sent = try std.posix.send(socket_fd, std.mem.asBytes(&message), 0);
+        const bytes_sent = try os_compat.send(socket_fd, std.mem.asBytes(&message), 0);
         if (bytes_sent != HEADER_SIZE) {
             return error.IncompleteWrite;
         }
@@ -244,7 +245,7 @@ pub const WireProtocol = struct {
     pub fn sendErrorResponse(socket_fd: std.posix.fd_t, key: u64, error_status: WireMessage.Status) !void {
         const message = WireMessage.init(.error_response, key, 0, error_status);
 
-        const bytes_sent = try std.posix.send(socket_fd, std.mem.asBytes(&message), 0);
+        const bytes_sent = try os_compat.send(socket_fd, std.mem.asBytes(&message), 0);
         if (bytes_sent != HEADER_SIZE) {
             return error.IncompleteWrite;
         }
@@ -264,7 +265,7 @@ pub const WireProtocol = struct {
     pub fn receiveReadResponse(socket_fd: std.posix.fd_t, allocator: std.mem.Allocator) !ReadResult {
         // Receive header
         var header_bytes: [HEADER_SIZE]u8 = undefined;
-        const header_received = try std.posix.recv(socket_fd, &header_bytes, 0);
+        const header_received = try os_compat.recv(socket_fd, &header_bytes, 0);
         if (header_received != HEADER_SIZE) {
             return error.IncompleteRead;
         }
@@ -292,7 +293,7 @@ pub const WireProtocol = struct {
             }
 
             const data = try allocator.alloc(u8, data_length);
-            const data_received = try std.posix.recv(socket_fd, data, 0);
+            const data_received = try os_compat.recv(socket_fd, data, 0);
             if (data_received != data_length) {
                 allocator.free(data);
                 return error.IncompleteRead;
@@ -306,7 +307,7 @@ pub const WireProtocol = struct {
 
     pub fn receiveWriteResponse(socket_fd: std.posix.fd_t) !bool {
         var header_bytes: [HEADER_SIZE]u8 = undefined;
-        const header_received = try std.posix.recv(socket_fd, &header_bytes, 0);
+        const header_received = try os_compat.recv(socket_fd, &header_bytes, 0);
         if (header_received != HEADER_SIZE) {
             return error.IncompleteRead;
         }
@@ -322,7 +323,7 @@ pub const WireProtocol = struct {
 
     pub fn receiveDeleteResponse(socket_fd: std.posix.fd_t) !bool {
         var header_bytes: [HEADER_SIZE]u8 = undefined;
-        const header_received = try std.posix.recv(socket_fd, &header_bytes, 0);
+        const header_received = try os_compat.recv(socket_fd, &header_bytes, 0);
         if (header_received != HEADER_SIZE) {
             return error.IncompleteRead;
         }

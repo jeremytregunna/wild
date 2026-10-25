@@ -1,4 +1,5 @@
 const std = @import("std");
+const os_compat = @import("os_compat.zig");
 const flat_hash_storage = @import("flat_hash_storage.zig");
 
 // WAL entry - identical to CacheLineRecord for zero-copy
@@ -99,7 +100,7 @@ pub const ThreadLocalWAL = struct {
             std.math.floorPowerOfTwo(u32, capacity);
 
         // Pre-allocate all ring buffer memory
-        const buffer = try allocator.alignedAlloc(WALEntry, 64, actual_capacity);
+        const buffer = try allocator.alignedAlloc(WALEntry, @fromBackingInt(@intCast(6)), actual_capacity); // 2^6 = 64
 
         // Initialize all entries as invalid
         for (buffer) |*entry| {
@@ -210,7 +211,7 @@ pub const DurabilityManager = struct {
     current_file_id: std.atomic.Value(u64),
     wal_base_path: []const u8,
     wal_files: std.ArrayList(WALFileInfo), // Track all WAL files for retention
-    wal_files_mutex: std.Thread.Mutex,
+    wal_files_mutex: os_compat.Mutex,
 
     // Retention policy
     config: Config,
@@ -236,9 +237,9 @@ pub const DurabilityManager = struct {
     awaiting: ?*WALCompletion,
 
     // Queue locks
-    unqueued_lock: std.Thread.Mutex,
-    completed_lock: std.Thread.Mutex,
-    awaiting_lock: std.Thread.Mutex,
+    unqueued_lock: os_compat.Mutex,
+    completed_lock: os_compat.Mutex,
+    awaiting_lock: os_compat.Mutex,
 
     // Completion tracking
     pending_ios: std.atomic.Value(u32),
@@ -309,7 +310,7 @@ pub const DurabilityManager = struct {
         );
 
         // Initialize WAL files list
-        var wal_files = std.ArrayList(WALFileInfo).init(allocator);
+        var wal_files: std.ArrayList(WALFileInfo) = .empty;
 
         // Add initial WAL file to tracking
         const initial_file_info = WALFileInfo{
@@ -318,9 +319,9 @@ pub const DurabilityManager = struct {
             .start_batch_id = 0,
             .end_batch_id = 0,
             .file_size = 0,
-            .created_timestamp = std.time.timestamp(),
+            .created_timestamp = os_compat.timestamp(),
         };
-        try wal_files.append(initial_file_info);
+        try wal_files.append(allocator, initial_file_info);
 
         // Initialize io_uring
         const ring = try std.os.linux.IoUring.init(config.io_uring_entries, 0);
@@ -338,7 +339,7 @@ pub const DurabilityManager = struct {
         else
             std.math.floorPowerOfTwo(u32, batch_buffer_count);
 
-        const batch_buffers = try allocator.alignedAlloc(WALBatch, 512, actual_buffer_count);
+        const batch_buffers = try allocator.alignedAlloc(WALBatch, @fromBackingInt(@intCast(9)), actual_buffer_count); // 2^9 = 512
         const completions = try allocator.alloc(WALCompletion, actual_buffer_count);
 
         // Initialize all batch buffers and completions
@@ -362,7 +363,7 @@ pub const DurabilityManager = struct {
             .current_file_id = std.atomic.Value(u64).init(0),
             .wal_base_path = wal_base_path,
             .wal_files = wal_files,
-            .wal_files_mutex = std.Thread.Mutex{},
+            .wal_files_mutex = os_compat.Mutex{},
             .config = config,
             .ring = ring,
             .tls_wals = tls_wals,
@@ -374,9 +375,9 @@ pub const DurabilityManager = struct {
             .unqueued = null,
             .completed = null,
             .awaiting = null,
-            .unqueued_lock = std.Thread.Mutex{},
-            .completed_lock = std.Thread.Mutex{},
-            .awaiting_lock = std.Thread.Mutex{},
+            .unqueued_lock = os_compat.Mutex{},
+            .completed_lock = os_compat.Mutex{},
+            .awaiting_lock = os_compat.Mutex{},
             .pending_ios = std.atomic.Value(u32).init(0),
             .completed_ios = std.atomic.Value(u64).init(0),
             .durability_thread = null,
@@ -402,7 +403,7 @@ pub const DurabilityManager = struct {
         self.ring.deinit();
 
         // Close current WAL file
-        std.posix.close(self.current_wal_fd);
+        os_compat.close(self.current_wal_fd);
 
         // Clean up WAL files list
         self.wal_files_mutex.lock();
@@ -410,7 +411,7 @@ pub const DurabilityManager = struct {
         for (self.wal_files.items) |*file_info| {
             file_info.deinit(self.allocator);
         }
-        self.wal_files.deinit();
+        self.wal_files.deinit(self.allocator);
         self.allocator.free(self.wal_base_path);
 
         // Free thread-local WAL rings
@@ -485,7 +486,7 @@ pub const DurabilityManager = struct {
         }
 
         // Close old file and switch to new
-        std.posix.close(self.current_wal_fd);
+        os_compat.close(self.current_wal_fd);
         self.current_wal_fd = new_wal_fd;
         self.current_wal_offset.store(0, .release);
 
@@ -496,9 +497,9 @@ pub const DurabilityManager = struct {
             .start_batch_id = self.batches_written.load(.acquire),
             .end_batch_id = 0, // Will be set when file is rotated
             .file_size = 0,
-            .created_timestamp = std.time.timestamp(),
+            .created_timestamp = os_compat.timestamp(),
         };
-        try self.wal_files.append(new_file_info);
+        try self.wal_files.append(self.allocator, new_file_info);
 
         // Clean up old files
         self.cleanupOldWALFiles();
@@ -506,11 +507,11 @@ pub const DurabilityManager = struct {
 
     // Remove old WAL files based on retention policy
     fn cleanupOldWALFiles(self: *Self) void {
-        const current_time = std.time.timestamp();
+        const current_time = os_compat.timestamp();
         const retention_seconds = @as(i64, self.config.retention_hours) * 3600;
 
-        var files_to_remove = std.ArrayList(usize).init(self.allocator);
-        defer files_to_remove.deinit();
+        var files_to_remove: std.ArrayList(usize) = .empty;
+        defer files_to_remove.deinit(self.allocator);
 
         // Find files to remove (keep files_mutex locked for consistency)
         for (self.wal_files.items, 0..) |*file_info, i| {
@@ -519,7 +520,7 @@ pub const DurabilityManager = struct {
             const should_remove_by_count = i < self.wal_files.items.len - self.config.max_wal_files;
 
             if (should_remove_by_age or should_remove_by_count) {
-                files_to_remove.append(i) catch continue;
+                files_to_remove.append(self.allocator, i) catch continue;
             }
         }
 
@@ -531,7 +532,7 @@ pub const DurabilityManager = struct {
             var file_info = self.wal_files.orderedRemove(file_index);
 
             // Delete the actual file
-            std.posix.unlink(file_info.file_path) catch {};
+            os_compat.unlink(file_info.file_path) catch {};
             file_info.deinit(self.allocator);
         }
     }
@@ -622,7 +623,7 @@ pub const DurabilityManager = struct {
         }
     }
 
-    fn enqueueCompletion(self: *Self, head: *?*WALCompletion, completion: *WALCompletion, lock: *std.Thread.Mutex) void {
+    fn enqueueCompletion(self: *Self, head: *?*WALCompletion, completion: *WALCompletion, lock: *os_compat.Mutex) void {
         _ = self;
         lock.lock();
         defer lock.unlock();
@@ -631,7 +632,7 @@ pub const DurabilityManager = struct {
         head.* = completion;
     }
 
-    fn dequeueCompletion(self: *Self, head: *?*WALCompletion, lock: *std.Thread.Mutex) ?*WALCompletion {
+    fn dequeueCompletion(self: *Self, head: *?*WALCompletion, lock: *os_compat.Mutex) ?*WALCompletion {
         _ = self;
         lock.lock();
         defer lock.unlock();
@@ -690,12 +691,12 @@ pub const DurabilityManager = struct {
                         _ = self.ring.submit() catch |err| switch (err) {
                             error.SystemResources => {
                                 submit_attempts += 1;
-                                std.time.sleep(@as(u64, 1000) * submit_attempts); // Exponential backoff
+                                os_compat.sleep(@as(u64, 1000) * submit_attempts); // Exponential backoff
                                 continue;
                             },
                             error.CompletionQueueOvercommitted => {
                                 submit_attempts += 1;
-                                std.time.sleep(@as(u64, 1000) * submit_attempts); // Exponential backoff
+                                os_compat.sleep(@as(u64, 1000) * submit_attempts); // Exponential backoff
                                 continue;
                             },
                             else => {
@@ -714,14 +715,14 @@ pub const DurabilityManager = struct {
                         completion_attempts += 1;
                         std.debug.print("Completion processing error: {} (attempt {})\n", .{ err, completion_attempts });
                         if (completion_attempts >= 3) break;
-                        std.time.sleep(@as(u64, 1000) * completion_attempts);
+                        os_compat.sleep(@as(u64, 1000) * completion_attempts);
                         continue;
                     };
                     break; // Success
                 }
             } else {
                 // No work - sleep briefly
-                std.time.sleep(1000); // 1μs
+                os_compat.sleep(1000); // 1μs
             }
         }
 
@@ -740,9 +741,9 @@ pub const DurabilityManager = struct {
             if (cleanup_attempts > 20) {
                 // After 20 attempts, start backing off more aggressively
                 const backoff_ms = @min(cleanup_attempts - 20, 10);
-                std.time.sleep(@as(u64, backoff_ms) * 1000_000); // Convert to nanoseconds
+                os_compat.sleep(@as(u64, backoff_ms) * 1000_000); // Convert to nanoseconds
             } else {
-                std.time.sleep(1000); // 1μs between early attempts
+                os_compat.sleep(1000); // 1μs between early attempts
             }
         }
 
@@ -791,7 +792,7 @@ pub const DurabilityManager = struct {
                     // Strategy 3: Force fsync to ensure data is on disk
                     if (shutdown_attempts == 300) {
                         std.debug.print("Forcing fsync to ensure data persistence...\n", .{});
-                        std.posix.fsync(self.current_wal_fd) catch {};
+                        os_compat.fsync(self.current_wal_fd) catch {};
                     }
 
                     // Continue trying completions
@@ -827,11 +828,11 @@ pub const DurabilityManager = struct {
                 if (shutdown_attempts < 50) {
                     // No delay for first attempts
                 } else if (shutdown_attempts < 200) {
-                    std.time.sleep(1000); // 1μs
+                    os_compat.sleep(1000); // 1μs
                 } else if (shutdown_attempts < 400) {
-                    std.time.sleep(10_000); // 10μs
+                    os_compat.sleep(10_000); // 10μs
                 } else {
-                    std.time.sleep(100_000); // 100μs
+                    os_compat.sleep(100_000); // 100μs
                 }
             }
 
@@ -843,7 +844,7 @@ pub const DurabilityManager = struct {
                 std.debug.print("   Data has been written to WAL file ({} bytes) but io_uring completions are stuck\n", .{self.current_wal_offset.load(.acquire)});
 
                 // Final desperate attempt: force sync
-                std.posix.fsync(self.current_wal_fd) catch {};
+                os_compat.fsync(self.current_wal_fd) catch {};
                 std.debug.print("   Forced fsync completed - data should be durable on disk\n", .{});
             }
         } else {
@@ -868,7 +869,6 @@ pub const DurabilityManager = struct {
                     // Try again after flush
                     break :blk try self.ring.get_sqe();
                 },
-                else => return err,
             }
         };
 
@@ -907,12 +907,12 @@ pub const DurabilityManager = struct {
             const completed = self.ring.submit_and_wait(1) catch |err| switch (err) {
                 error.SystemResources => {
                     // io_uring overcommitted - wait and retry
-                    std.time.sleep(1000); // 1μs
+                    os_compat.sleep(1000); // 1μs
                     return;
                 },
                 error.CompletionQueueOvercommitted => {
                     // CQ overcommitted - wait and retry
-                    std.time.sleep(1000); // 1μs
+                    os_compat.sleep(1000); // 1μs
                     return;
                 },
                 else => return err,

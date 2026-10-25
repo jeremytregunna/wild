@@ -1,12 +1,17 @@
 const std = @import("std");
+const os_compat = @import("os_compat.zig");
 const wild = @import("wild.zig");
 const static_allocator = @import("static_allocator.zig");
 const replication = @import("replication.zig");
+const server = @import("server.zig");
 
 // WILD Database Daemon - Production server for WILD database
 pub const WildDaemon = struct {
     database: ?wild.WILD,
     static_alloc: ?static_allocator.StaticAllocator,
+    database_arena: ?std.heap.ArenaAllocator,
+    server: ?server.WildServer,
+    server_thread: ?std.Thread,
     config: DaemonConfig,
     allocator: std.mem.Allocator,
 
@@ -91,6 +96,9 @@ pub const WildDaemon = struct {
         return Self{
             .database = null,
             .static_alloc = null,
+            .database_arena = null,
+            .server = null,
+            .server_thread = null,
             .config = config,
             .allocator = allocator,
             .is_running = std.atomic.Value(bool).init(false),
@@ -101,6 +109,13 @@ pub const WildDaemon = struct {
     pub fn deinit(self: *Self) void {
         self.stop();
 
+        // The accept loop runs on its own thread and touches the database and
+        // the static allocator. Stop it and wait before anything is freed.
+        if (self.server_thread) |thread| {
+            thread.join();
+            self.server_thread = null;
+        }
+
         if (self.database) |*db| {
             self.static_alloc.?.transitionToDeinit();
             db.deinit();
@@ -109,6 +124,10 @@ pub const WildDaemon = struct {
         if (self.static_alloc) |*static_alloc| {
             static_alloc.deinit();
         }
+
+        if (self.database_arena) |*arena| {
+            arena.deinit();
+        }
     }
 
     pub fn start(self: *Self) !void {
@@ -116,21 +135,25 @@ pub const WildDaemon = struct {
             return error.AlreadyRunning;
         }
 
-        // Initialize database with static allocator
-        var database_arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer database_arena.deinit();
-
-        var static_alloc = static_allocator.StaticAllocator.init(database_arena.allocator());
+        // The database and the server store raw allocator pointers, so the arena
+        // and the static allocator must live in the daemon, at an address that
+        // outlives this function. As locals they handed both of them a pointer
+        // into a dead stack frame, which the shutdown path then read.
+        const database_arena = std.heap.ArenaAllocator.init(self.allocator);
+        self.database_arena = database_arena;
+        self.static_alloc = static_allocator.StaticAllocator.init(self.database_arena.?.allocator());
 
         const db_config = wild.WILD.Config{
             .target_capacity = self.config.capacity,
         };
 
-        var database = try wild.WILD.init(static_alloc.allocator(), db_config);
+        const database = try wild.WILD.init(self.static_alloc.?.allocator(), db_config);
+        // Store the database before anything takes its address.
+        self.database = database;
 
         // Enable WAL if configured
         if (self.config.enable_wal) {
-            try database.enableDurabilityForStorage(self.config.wal_path.?);
+            try self.database.?.enableDurabilityForStorage(self.config.wal_path.?);
         }
 
         // Enable replication based on mode
@@ -146,7 +169,7 @@ pub const WildDaemon = struct {
                     std.debug.print("Error: --auth-secret is required for replication mode\n", .{});
                     return error.AuthSecretRequired;
                 };
-                try database.enableReplicationAsPrimary(self.config.replication_port.?, auth_secret);
+                try self.database.?.enableReplicationAsPrimary(self.config.replication_port.?, auth_secret);
                 std.debug.print("WILD daemon started as PRIMARY on replication port {}\n", .{self.config.replication_port.?});
             },
             .replica => {
@@ -157,20 +180,35 @@ pub const WildDaemon = struct {
                     std.debug.print("Error: --auth-secret is required for replication mode\n", .{});
                     return error.AuthSecretRequired;
                 };
-                try database.enableReplicationAsReplica(self.config.primary_address.?, self.config.primary_port.?, auth_secret);
+                try self.database.?.enableReplicationAsReplica(self.config.primary_address.?, self.config.primary_port.?, auth_secret);
                 std.debug.print("WILD daemon started as REPLICA connecting to {s}:{}\n", .{ self.config.primary_address.?, self.config.primary_port.? });
             },
         }
 
-        // Transition to static state
-        static_alloc.transitionToStatic();
+        // Start the client-facing server. WildServer allocates from the static
+        // allocator, so it must be initialised before the transition freezes
+        // it. An empty secret means the server takes commands without a secret.
+        const auth_secret = self.config.auth_secret orelse "";
+        const wild_server = try server.WildServer.init(
+            &self.database.?,
+            &self.static_alloc.?,
+            self.config.bind_address,
+            self.config.port,
+            auth_secret,
+        );
 
-        // Store initialized components
-        self.database = database;
-        self.static_alloc = static_alloc;
+        // Transition to static state
+        self.static_alloc.?.transitionToStatic();
+
+        self.server = wild_server;
         self.is_running.store(true, .release);
 
+        // The accept loop blocks, so it gets its own thread. The daemon main
+        // loop stays free to print stats and to watch for a shutdown signal.
+        self.server_thread = try std.Thread.spawn(.{}, serveClientConnections, .{&self.server.?});
+
         std.debug.print("WILD daemon started successfully\n", .{});
+        std.debug.print("  Client server: {s}:{}\n", .{ self.config.bind_address, self.config.port });
         std.debug.print("  Capacity: {} records\n", .{self.config.capacity});
         std.debug.print("  WAL: {s}\n", .{if (self.config.enable_wal) "enabled" else "disabled"});
         std.debug.print("  Replication: {s}\n", .{@tagName(self.config.replication_mode)});
@@ -180,6 +218,11 @@ pub const WildDaemon = struct {
         if (!self.is_running.load(.acquire)) return;
 
         self.shutdown_signal.store(true, .release);
+
+        // Ask the accept loop to return before deinit frees its memory.
+        if (self.server) |*srv| {
+            srv.requestShutdown();
+        }
 
         // Disable replication gracefully
         if (self.database) |*db| {
@@ -192,6 +235,13 @@ pub const WildDaemon = struct {
 
     pub fn isRunning(self: *const Self) bool {
         return self.is_running.load(.acquire);
+    }
+
+    /// Thread entry for the blocking accept loop inside WildServer.start.
+    fn serveClientConnections(wild_server: *server.WildServer) void {
+        wild_server.start() catch |err| {
+            std.debug.print("WILD client server stopped: {}\n", .{err});
+        };
     }
 
     pub fn shouldShutdown(self: *const Self) bool {
@@ -276,7 +326,7 @@ pub const WildDaemon = struct {
 // Signal handling for graceful shutdown
 var global_daemon: ?*WildDaemon = null;
 
-fn signalHandler(sig: c_int) callconv(.C) void {
+fn signalHandler(sig: std.posix.SIG) callconv(.c) void {
     _ = sig;
     if (global_daemon) |daemon| {
         daemon.stop();
@@ -292,7 +342,7 @@ pub fn runDaemon(allocator: std.mem.Allocator, config: WildDaemon.DaemonConfig) 
     global_daemon = &daemon;
     const act = std.posix.Sigaction{
         .handler = .{ .handler = signalHandler },
-        .mask = std.posix.empty_sigset,
+        .mask = std.posix.sigset_t{0},
         .flags = 0,
     };
     std.posix.sigaction(std.posix.SIG.INT, &act, null);
@@ -301,13 +351,22 @@ pub fn runDaemon(allocator: std.mem.Allocator, config: WildDaemon.DaemonConfig) 
     // Start the daemon
     try daemon.start();
 
-    // Main daemon loop
-    while (daemon.isRunning() and !daemon.shouldShutdown()) {
-        // Print stats every 30 seconds
-        std.time.sleep(30_000_000_000); // 30 seconds
+    // Main daemon loop. The sleep is sliced: a single 30-second sleep does not
+    // notice the shutdown flag, so a quit idle server would wait for the next
+    // stats report to arrive before it stopped.
+    const slice_ns: u64 = 50_000_000; // 50 ms
+    const stats_interval_ms: u64 = 30_000;
+    var since_report_ms: u64 = 0;
 
-        if (daemon.getStats()) |stats| {
-            stats.print();
+    while (daemon.isRunning() and !daemon.shouldShutdown()) {
+        os_compat.sleep(slice_ns);
+        since_report_ms += slice_ns / std.time.ns_per_ms;
+
+        if (since_report_ms >= stats_interval_ms) {
+            since_report_ms = 0;
+            if (daemon.getStats()) |stats| {
+                stats.print();
+            }
         }
     }
 

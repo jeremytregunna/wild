@@ -17,7 +17,7 @@ pub const StaticAllocator = struct {
         return Self{
             .state = .init,
             .backing_allocator = backing_allocator,
-            .allocated_memory = std.ArrayList([]u8).init(backing_allocator),
+            .allocated_memory = .empty,
         };
     }
 
@@ -38,7 +38,7 @@ pub const StaticAllocator = struct {
         for (self.allocated_memory.items) |memory| {
             self.backing_allocator.free(memory);
         }
-        self.allocated_memory.deinit();
+        self.allocated_memory.deinit(self.backing_allocator);
     }
 
     pub fn allocator(self: *Self) std.mem.Allocator {
@@ -65,7 +65,7 @@ pub const StaticAllocator = struct {
         const memory = result[0..len];
 
         // Track allocated memory for cleanup
-        self.allocated_memory.append(memory) catch {
+        self.allocated_memory.append(self.backing_allocator, memory) catch {
             self.backing_allocator.rawFree(memory, ptr_align, ret_addr);
             return null;
         };

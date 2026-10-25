@@ -148,11 +148,11 @@ test "slab allocator alignment" {
     const allocator = slab_alloc.allocator();
 
     // Test that allocations are properly aligned
-    const ptr8 = try allocator.alignedAlloc(u8, 8, 32);
+    const ptr8 = try allocator.alignedAlloc(u8, .fromByteUnits(8), 32);
     defer allocator.free(ptr8);
     try std.testing.expect(@intFromPtr(ptr8.ptr) % 8 == 0);
 
-    const ptr16 = try allocator.alignedAlloc(u8, 16, 32);
+    const ptr16 = try allocator.alignedAlloc(u8, .fromByteUnits(16), 32);
     defer allocator.free(ptr16);
     try std.testing.expect(@intFromPtr(ptr16.ptr) % 16 == 0);
 }
@@ -163,8 +163,8 @@ test "slab allocator stress test" {
 
     const allocator = slab_alloc.allocator();
 
-    var ptrs = std.ArrayList([]u8).init(std.testing.allocator);
-    defer ptrs.deinit();
+    var ptrs: std.ArrayList([]u8) = .empty;
+    defer ptrs.deinit(std.testing.allocator);
 
     var prng = std.Random.DefaultPrng.init(42);
     const random = prng.random();
@@ -181,7 +181,7 @@ test "slab allocator stress test" {
             const sizes = [_]usize{ 8, 16, 32, 64, 128, 256, 512 };
             const size = sizes[random.uintLessThan(usize, sizes.len)];
             const ptr = try allocator.alloc(u8, size);
-            try ptrs.append(ptr);
+            try ptrs.append(std.testing.allocator, ptr);
 
             // Write pattern
             for (ptr, 0..) |*byte, i| {

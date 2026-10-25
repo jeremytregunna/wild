@@ -1,4 +1,5 @@
 const std = @import("std");
+const os_compat = @import("os_compat.zig");
 const wild = @import("wild.zig");
 
 // Performance metrics collection and monitoring for WILD database
@@ -86,7 +87,7 @@ pub const MetricsCollector = struct {
             .memory_usage_bytes = std.atomic.Value(u64).init(0),
             .load_factor_x1000 = std.atomic.Value(u32).init(0),
 
-            .last_snapshot_time = std.atomic.Value(u64).init(@as(u64, @intCast(std.time.nanoTimestamp()))),
+            .last_snapshot_time = std.atomic.Value(u64).init(@as(u64, @intCast(os_compat.nanoTimestamp()))),
             .snapshot_interval_ns = config.snapshot_interval_seconds * 1_000_000_000,
 
             .allocator = allocator,
@@ -137,14 +138,14 @@ pub const MetricsCollector = struct {
 
     // Check if it's time to take a performance snapshot
     pub fn shouldTakeSnapshot(self: *const Self) bool {
-        const now = @as(u64, @intCast(std.time.nanoTimestamp()));
+        const now = @as(u64, @intCast(os_compat.nanoTimestamp()));
         const last_snapshot = self.last_snapshot_time.load(.monotonic);
         return (now - last_snapshot) >= self.snapshot_interval_ns;
     }
 
     // Take a performance snapshot (for reporting/monitoring)
     pub fn takeSnapshot(self: *Self) PerformanceSnapshot {
-        const now = @as(u64, @intCast(std.time.nanoTimestamp()));
+        const now = @as(u64, @intCast(os_compat.nanoTimestamp()));
         const last_snapshot = self.last_snapshot_time.swap(now, .monotonic);
         const duration_ns = now - last_snapshot;
         const duration_sec = @as(f64, @floatFromInt(duration_ns)) / 1_000_000_000.0;
