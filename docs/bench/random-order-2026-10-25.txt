@@ -1,0 +1,4 @@
+key order: shuffled (seed 0x9e3779b97f4a7c15)
+  read-batch        5033164 ops      33.4 ns/op       29977687 ops/sec  found 5033164  populated 5033164 (unmeasured)  IPC 0.27  cache misses (proxy) 20993914
+key order: shuffled (seed 0x9e3779b97f4a7c15)
+  read-pipelined    5033164 ops      21.9 ns/op       45710237 ops/sec  found 5033164  populated 5033164 (unmeasured)  IPC 0.54  cache misses (proxy) 19245245

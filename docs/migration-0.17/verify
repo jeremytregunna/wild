@@ -1,0 +1,269 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Green-light gate for WILD. Run this before you report any work as complete.
+#
+# Every check runs. The script collects all failures, prints one PASS or FAIL
+# line per check, then exits nonzero if any check failed.
+#
+#   scripts/verify            all checks
+#   scripts/verify --fast     skip the ReleaseFast build
+
+cd "$(dirname "$0")/.."
+
+FAILURES=0
+REQUIRED_MINOR=17
+
+log() { printf '%s\n' "$*"; }
+
+check() {
+    local name="$1"
+    shift
+    local out
+    if out=$("$@" 2>&1); then
+        log "PASS  $name"
+    else
+        log "FAIL  $name"
+        printf '%s\n' "$out" | tail -n 20 | sed 's/^/        /'
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+
+warn() {
+    local name="$1"
+    shift
+    local out
+    if out=$("$@" 2>&1); then
+        log "PASS  $name"
+    else
+        log "WARN  $name (not blocking)"
+        printf '%s\n' "$out" | head -n 8 | sed 's/^/        /'
+    fi
+}
+
+log "WILD verify — $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+log ""
+
+# 1 — Toolchain. The build breaks on anything older than 0.17.
+check "zig version is 0.17.x" bash -c '
+    v=$(zig version)
+    major=${v%%.*}
+    rest=${v#*.}
+    minor=${rest%%.*}
+    if [ "$major" != "0" ] || [ "$minor" != "'"$REQUIRED_MINOR"'" ]; then
+        echo "found zig $v, need 0.'"$REQUIRED_MINOR"'.x"
+        exit 1
+    fi'
+
+# 2 — The declared floor must not exceed the toolchain in use.
+check "minimum_zig_version matches the toolchain" bash -c '
+    declared=$(sed -n "s/.*minimum_zig_version = \"\([0-9.]*\)\".*/\1/p" build.zig.zon)
+    running=$(zig version)
+    [ "$declared" = "$running" ] || { echo "build.zig.zon says $declared, zig is $running"; exit 1; }'
+
+# 3 — Format. The repository is not fmt-clean at the migration baseline, so
+#     this is a warning. Fix it in its own commit, never inside a migration.
+warn "zig fmt --check" bash -c 'zig fmt --check $(find . -name "*.zig" -not -path "./.zig-cache/*" -not -path "./zig-out/*")'
+
+# 4 — Dependencies. WILD has none. An unlisted package needs human approval.
+check "no unapproved dependency" bash -c '
+    if grep -vE "^[[:space:]]*//" build.zig.zon | grep -qE "\.url = |\.hash = |\.path = "; then
+        echo "build.zig.zon declares a dependency; add it to deps.allow with human approval"
+        exit 1
+    fi'
+
+# 5 — Compile everything that something calls.
+check "zig build" zig build
+
+# 6 — Unit tests.
+check "zig build test" zig build test
+
+# 7 — Compile everything, even code nothing calls. Zig analyses lazily, so this
+#     is the only step that type-checks unreferenced functions.
+check "zig build deep-check" zig build deep-check
+
+# 8 — The standalone programs under tests/. Nothing else builds them.
+check "zig build check-tests" zig build check-tests
+
+# 9 — The mode the project ships in.
+if [ "${1:-}" != "--fast" ]; then
+    check "zig build -Doptimize=ReleaseFast" zig build -Doptimize=ReleaseFast
+fi
+
+# 10 — End to end: the real server, the real client code, one TCP round trip.
+run_e2e() {
+    local port=17878
+    local logdir
+    logdir=$(mktemp -d)
+
+    ./zig-out/bin/e2e-server "$port" testsecret >"$logdir/server.log" 2>&1 &
+    local server_pid=$!
+
+    local listening=1
+    local attempt=0
+    while [ "$attempt" -lt 100 ]; do
+        if ss -tln 2>/dev/null | grep -q ":$port"; then
+            listening=0
+            break
+        fi
+        sleep 0.1
+        attempt=$((attempt + 1))
+    done
+
+    if [ "$listening" -eq 0 ] && ./zig-out/bin/e2e-client "127.0.0.1:$port" testsecret \
+        >"$logdir/client.log" 2>&1; then
+        log "PASS  end to end: set, get, delete over TCP"
+    else
+        log "FAIL  end to end: set, get, delete over TCP"
+        tail -n 8 "$logdir/server.log" "$logdir/client.log" 2>/dev/null | sed 's/^/        /'
+        FAILURES=$((FAILURES + 1))
+    fi
+
+    kill "$server_pid" 2>/dev/null || true
+    wait "$server_pid" 2>/dev/null || true
+    rm -rf "$logdir"
+}
+run_e2e
+
+# 12 — Concurrency: several connections sit idle with a read posted, one of them
+# disconnects, and every remaining connection must still get its own answer.
+# This is the regression test for the io_uring completion tags: compacting the
+# client arrays used to orphan the moved connection's in-flight read, and the
+# run then hung until the test's own watchdog failed it.
+run_concurrency() {
+    local logdir
+    logdir=$(mktemp -d)
+
+    if timeout 90 ./zig-out/bin/e2e-concurrency >"$logdir/concurrency.log" 2>&1 \
+        && grep -q "e2e-concurrency: PASS" "$logdir/concurrency.log"; then
+        log "PASS  concurrency: responses stay with their connection across disconnects"
+    else
+        log "FAIL  concurrency: a connection lost its answer or a slot was reused wrongly"
+        tail -n 12 "$logdir/concurrency.log" 2>/dev/null | sed 's/^/        /'
+        FAILURES=$((FAILURES + 1))
+    fi
+
+    rm -rf "$logdir"
+}
+run_concurrency
+
+# 13 — Many connections, one drain, one batch. Also asserts the server actually
+# grouped the lookups, so the batch path cannot rot into dead code.
+run_pipelined() {
+    local logdir
+    logdir=$(mktemp -d)
+
+    if timeout 120 ./zig-out/bin/e2e-pipelined >"$logdir/pipelined.log" 2>&1 \
+        && grep -q "e2e-pipelined: PASS" "$logdir/pipelined.log"; then
+        log "PASS  batched server: 256 connections served, lookups grouped"
+    else
+        log "FAIL  batched server: concurrent requests were not answered correctly or never batched"
+        tail -n 12 "$logdir/pipelined.log" 2>/dev/null | sed 's/^/        /'
+        FAILURES=$((FAILURES + 1))
+    fi
+
+    rm -rf "$logdir"
+}
+run_pipelined
+
+# 11 — The shipped binaries together: `wild` serves, `wild-client` drives it.
+#      The unit tests cannot see this path, and it was broken for both Zig
+#      versions: the daemon never bound the client port, and the client never
+#      sent the secret the server reads first.
+run_daemon_e2e() {
+    local port=17879
+    local secret=gate-secret
+    local logdir
+    logdir=$(mktemp -d)
+
+    ./zig-out/bin/wild --port "$port" --capacity 10000 --auth-secret "$secret" \
+        >"$logdir/daemon.log" 2>&1 &
+    local daemon_pid=$!
+
+    local listening=1
+    local attempt=0
+    while [ "$attempt" -lt 100 ]; do
+        if ss -tln 2>/dev/null | grep -q ":$port"; then
+            listening=0
+            break
+        fi
+        sleep 0.1
+        attempt=$((attempt + 1))
+    done
+
+    local status=0
+    if [ "$listening" -ne 0 ]; then
+        log "FAIL  daemon end to end: the daemon never bound port $port"
+        tail -n 8 "$logdir/daemon.log" | sed 's/^/        /'
+        status=1
+    fi
+
+    if [ "$status" -eq 0 ]; then
+        # A client without the secret must be refused.
+        if ./zig-out/bin/wild-client "127.0.0.1:$port" set gate-key gate-value \
+            >"$logdir/noauth.log" 2>&1; then
+            log "FAIL  daemon end to end: a client without the secret was accepted"
+            status=1
+        fi
+    fi
+
+    if [ "$status" -eq 0 ]; then
+        # With the secret, a set then a get must return the value.
+        if ! WILD_AUTH_SECRET="$secret" ./zig-out/bin/wild-client "127.0.0.1:$port" \
+            set gate-key gate-value >>"$logdir/client.log" 2>&1; then
+            log "FAIL  daemon end to end: authenticated set failed"
+            tail -n 8 "$logdir/client.log" | sed 's/^/        /'
+            status=1
+        fi
+
+        local got
+        got=$(WILD_AUTH_SECRET="$secret" ./zig-out/bin/wild-client "127.0.0.1:$port" \
+            get gate-key 2>>"$logdir/client.log") || status=1
+        if [ "$got" != "gate-value" ]; then
+            log "FAIL  daemon end to end: expected gate-value, got '$got'"
+            status=1
+        fi
+    fi
+
+    # A quit signal must stop an idle daemon in about a second, not on the
+    # 30-second stats timer, and it must not panic on the way out.
+    if [ "$status" -eq 0 ]; then
+        kill -TERM "$daemon_pid" 2>/dev/null || true
+        attempt=0
+        while kill -0 "$daemon_pid" 2>/dev/null && [ "$attempt" -lt 40 ]; do
+            sleep 0.05
+            attempt=$((attempt + 1))
+        done
+        if kill -0 "$daemon_pid" 2>/dev/null; then
+            log "FAIL  daemon end to end: the daemon ignored SIGTERM"
+            status=1
+        elif grep -q "panic" "$logdir/daemon.log"; then
+            log "FAIL  daemon end to end: the daemon panicked during shutdown"
+            tail -n 12 "$logdir/daemon.log" | sed 's/^/        /'
+            status=1
+        fi
+    fi
+
+    if [ "$status" -eq 0 ]; then
+        log "PASS  daemon end to end: wild serves wild-client, auth enforced, clean SIGTERM"
+    else
+        FAILURES=$((FAILURES + 1))
+    fi
+
+    kill -9 "$daemon_pid" 2>/dev/null || true
+    wait "$daemon_pid" 2>/dev/null || true
+    rm -rf "$logdir"
+}
+run_daemon_e2e
+
+# 12 — No generated code to keep in sync with a contract file yet. When
+#      docs/WIRE_PROTOCOL.md becomes the source of truth, add the drift check
+#      here and make it blocking.
+log "SKIP  contract drift (no contract file; docs/WIRE_PROTOCOL.md is manual)"
+
+log ""
+if [ "$FAILURES" -eq 0 ]; then
+    log "verify: all checks passed"
+    exit 0
+fi
+log "verify: $FAILURES check(s) failed"
+exit 1

@@ -1,0 +1,26 @@
+WILD Database Benchmark
+L3 96 MB · record 64 B · load factor 0.60
+── L3-resident ──
+capacity 2097152 records (128 MB table) · 1258291 keys
+  write             1258291 ops      40.3 ns/op       24789025 ops/sec  IPC 0.51  cache misses (proxy) 4493624
+  read              1258291 ops      20.1 ns/op       49630469 ops/sec  found 1258291  IPC 0.34  cache misses (proxy) 4323603
+  read-random       1258291 ops      32.8 ns/op       30515184 ops/sec  found 1258291  IPC 0.36  cache misses (proxy) 5791417
+  read-batch        1258291 ops      23.1 ns/op       43307805 ops/sec  found 1258291  IPC 0.38  cache misses (proxy) 5281788
+  read-pipelined    1258291 ops      15.2 ns/op       65994732 ops/sec  found 1258291  IPC 0.78  cache misses (proxy) 4306163
+  mixed           286820096 ops       7.0 ns/op      143409099 ops/sec  IPC 2.05  cache misses (proxy) 46653
+── DRAM-resident ──
+capacity 8388608 records (512 MB table) · 5033164 keys
+  write             5033164 ops      45.7 ns/op       21878780 ops/sec  IPC 0.44  cache misses (proxy) 20080716
+  read              5033164 ops      28.5 ns/op       35074922 ops/sec  found 5033164  IPC 0.24  cache misses (proxy) 18808550
+  read-random       5033164 ops      52.4 ns/op       19089877 ops/sec  found 5033164  IPC 0.22  cache misses (proxy) 26614119
+  read-batch        5033164 ops      32.5 ns/op       30726443 ops/sec  found 5033164  IPC 0.27  cache misses (proxy) 20994509
+  read-pipelined    5033164 ops      20.6 ns/op       48595171 ops/sec  found 5033164  IPC 0.56  cache misses (proxy) 19200549
+  mixed           289255680 ops       6.9 ns/op      144627167 ops/sec  IPC 2.06  cache misses (proxy) 18608
+── comparison ──
+phase                  L3 ns/op       DRAM ns/op     ratio
+write                      40.3             45.7      1.1x
+read                       20.1             28.5      1.4x
+read-random                32.8             52.4      1.6x
+read-batch                 23.1             32.5      1.4x
+read-pipelined             15.2             20.6      1.4x
+mixed                       7.0              6.9      1.0x

@@ -1,0 +1,28 @@
+WILD Database Benchmark
+L3 96 MB · record 64 B · load factor 0.60
+── L3-resident ──
+capacity 2097152 records (128 MB table) · 1258291 keys
+  write             1258291 ops      38.7 ns/op       25809115 ops/sec  IPC 0.53  cache misses (proxy) 4713707
+  read              1258291 ops      20.7 ns/op       48252122 ops/sec  found 1258291  IPC 0.33  cache misses (proxy) 4374267
+  read-random       1258291 ops      32.7 ns/op       30595725 ops/sec  found 1258291  IPC 0.36  cache misses (proxy) 5831893
+  read-batch        1258291 ops      23.1 ns/op       43265209 ops/sec  found 1258291  IPC 0.38  cache misses (proxy) 4812436
+  mixed           308025600 ops       6.5 ns/op      154012042 ops/sec  IPC 1.98  cache misses (proxy) 67657
+── DRAM-resident ──
+capacity 8388608 records (512 MB table) · 5033164 keys
+  write             5033164 ops      48.7 ns/op       20543254 ops/sec  IPC 0.42  cache misses (proxy) 20351200
+  read              5033164 ops      28.6 ns/op       34972143 ops/sec  found 5033164  IPC 0.24  cache misses (proxy) 18944220
+  read-random       5033164 ops      51.2 ns/op       19528609 ops/sec  found 5033164  IPC 0.23  cache misses (proxy) 26477785
+  read-batch        5033164 ops      32.6 ns/op       30713156 ops/sec  found 5033164  IPC 0.27  cache misses (proxy) 20651094
+  mixed           310197504 ops       6.4 ns/op      155097938 ops/sec  IPC 1.99  cache misses (proxy) 66587
+── comparison ──
+phase                  L3 ns/op       DRAM ns/op     ratio
+write                      38.7             48.7      1.3x
+                                                 IPC L3 0.53 / DRAM 0.42
+read                       20.7             28.6      1.4x
+                                                 IPC L3 0.33 / DRAM 0.24
+read-random                32.7             51.2      1.6x
+                                                 IPC L3 0.36 / DRAM 0.23
+read-batch                 23.1             32.6      1.4x
+                                                 IPC L3 0.38 / DRAM 0.27
+mixed                       6.5              6.4      1.0x
+                                                 IPC L3 1.98 / DRAM 1.99

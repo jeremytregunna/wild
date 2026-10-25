@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Fast loop for WILD: compile, unit tests, deep type-check, test programs.
+# Run scripts/verify before you report any work as complete.
+
+cd "$(dirname "$0")/.."
+
+zig build
+zig build test
+zig build deep-check
+zig build check-tests
+
+echo "test: all steps passed (run scripts/verify for the full gate)"

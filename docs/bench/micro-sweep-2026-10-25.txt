@@ -1,0 +1,11 @@
+L3 96 MB · record 64 B · load factor 0.60
+capacity 8388608 records (512 MB table) · 5033164 keys
+  read-pipe-1       5033164 ops      29.8 ns/op       33550995 ops/sec  found 5033164  populated 5033164 (unmeasured)  IPC 0.37  cache misses (proxy) 20942734
+  read-pipe-4       5033164 ops      23.3 ns/op       42851501 ops/sec  found 5033164  IPC 0.53  cache misses (proxy) 18934662
+  read-pipe-8       5033164 ops      21.7 ns/op       45986438 ops/sec  found 5033164  IPC 0.56  cache misses (proxy) 19393684
+  read-pipe-16      5033164 ops      23.3 ns/op       42877245 ops/sec  found 5033164  IPC 0.46  cache misses (proxy) 18860993
+  read-pipe-32      5033164 ops      24.4 ns/op       41042134 ops/sec  found 5033164  IPC 0.43  cache misses (proxy) 19712353
+  read-pipe-64      5033164 ops      24.6 ns/op       40656615 ops/sec  found 5033164  IPC 0.42  cache misses (proxy) 20346816
+  read-pipe-128     5033164 ops      25.0 ns/op       39921736 ops/sec  found 5033164  IPC 0.41  cache misses (proxy) 20878385
+  read-pipe-256     5033164 ops      24.9 ns/op       40090918 ops/sec  found 5033164  IPC 0.41  cache misses (proxy) 20839175
+- Used capacity: 5033164/8388608 (60.0%)

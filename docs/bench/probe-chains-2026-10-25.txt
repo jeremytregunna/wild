@@ -1,0 +1,23 @@
+--- load-factor 0.60 ---
+capacity 8388608 records (512 MB table) · 5033164 keys
+  probe-length      5033164 keys  mean 1.75 lines  p50 1  p90 3  p99 10  max 66  multi-line 30.0%  missing 0  overflow 2
+--- load-factor 0.80 ---
+capacity 8388608 records (512 MB table) · 6710886 keys
+  probe-length      6710886 keys  mean 3.00 lines  p50 1  p90 6  p99 29  max 339  multi-line 40.0%  missing 0  overflow 9483
+    cache line. Prefetch hides that; a load-factor cap removes it.
+--- load-factor 0.95 ---
+capacity 8388608 records (512 MB table) · 7969177 keys
+  probe-length      7969177 keys  mean 10.47 lines  p50 1  p90 15  p99 4803  max 4803  multi-line 47.5%  missing 0  overflow 253214
+    cache line. Prefetch hides that; a load-factor cap removes it.
+--- fill 0.60 (512 MB table) ---
+  read              5033164 ops      28.0 ns/op       35717896 ops/sec  found 5033164  populated 5033164 (unmeasured)  IPC 0.24  cache misses (proxy) 18929672
+  read-pipelined    5033164 ops      20.3 ns/op       49236738 ops/sec  found 5033164  populated 5033164 (unmeasured)  IPC 0.57  cache misses (proxy) 19185438
+  write             5033164 ops      45.1 ns/op       22161993 ops/sec  IPC 0.44  cache misses (proxy) 20425784
+--- fill 0.80 (512 MB table) ---
+  read              6710886 ops      43.4 ns/op       23057893 ops/sec  found 6710886  populated 6710886 (unmeasured)  IPC 0.22  cache misses (proxy) 36396642
+  read-pipelined    6710886 ops      29.9 ns/op       33394210 ops/sec  found 6710886  populated 6710886 (unmeasured)  IPC 0.52  cache misses (proxy) 35243471
+  write             6710886 ops      61.3 ns/op       16315533 ops/sec  IPC 0.38  cache misses (proxy) 41361261
+--- fill 0.95 (512 MB table) ---
+  read              7969177 ops      74.5 ns/op       13427326 ops/sec  found 7969177  populated 7969177 (unmeasured)  IPC 0.35  cache misses (proxy) 60473095
+  read-pipelined    7969177 ops      56.3 ns/op       17758906 ops/sec  found 7969177  populated 7969177 (unmeasured)  IPC 0.70  cache misses (proxy) 60771785
+  write             7969177 ops      86.2 ns/op       11597208 ops/sec  IPC 0.50  cache misses (proxy) 67330637

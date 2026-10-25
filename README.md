@@ -14,27 +14,42 @@ WILD (Within-cache Incredibly Lightweight Database) is a production-ready high-p
 # 1. Build WILD
 zig build
 
-# 2. Start primary database with authentication
-./zig-out/bin/wild --auth-secret mysecret --enable-wal --wal-path primary.wal
+# 2. Start the database. It serves clients on --port (default 7878).
+./zig-out/bin/wild --port 7878 --capacity 100000
 
-# 3. Connect with client
-./zig-out/bin/wild-client-example health
+# 3. Store and read a key. The value goes to stdout.
+./zig-out/bin/wild-client 127.0.0.1:7878 set greeting hello
+./zig-out/bin/wild-client 127.0.0.1:7878 get greeting   # prints: hello
+
+# 4. Stop it. An idle daemon exits within about a second.
+kill -TERM <pid>
 ```
+
+To check the whole thing without starting anything by hand, run
+`./scripts/verify`. It builds, runs the unit tests, type-checks code that
+nothing calls, and starts a real server to drive a real client over TCP.
 
 ## Performance Characteristics
 
-### Benchmark Results (Ryzen 9 7800X3D, 96MB L3 Cache)
+Built in ReleaseFast, the dev machine (Ryzen 7 7800X3D, 8 cores, 96 MB L3, 64-byte lines).
 
-| Operation | Latency | Throughput |
-|-----------|---------|------------|
-| **Single Read** | 20ns/op | 349.0M ops/sec |
-| **Single Write** | 42ns/op | 23.6M ops/sec |
-| **Batch Operations** | 2-28ns/op | 620M+ ops/sec |
+Two table sizes: 128 MB (80 MB actually touched, fits L3) and 512 MB (4.2 GB... no: 512 MB table, 5,033,164 keys, far past L3).
+
+ Storage, per key:
+
+| phase                     | L3-resident       | DRAM-resident     | DRAM IPC |
+|---------------------------|-------------------|-------------------|----------|
+| write                     | 34.1 ns · 29.3M/s | 45.4 ns · 22.0M/s | 0.44     |
+| read (one key at a time)  | 18.0 ns · 55.5M/s | 29.0 ns · 34.5M/s | 0.24     |
+| read, random order        | 31.4 ns · 31.9M/s | 51.9 ns · 19.3M/s | 0.22     |
+| read-batch (plain loop)   | 21.0 ns · 47.5M/s | 32.1 ns · 31.2M/s | 0.28     |
+| read-pipelined (prefetch) | 13.0 ns · 76.7M/s | 20.4 ns · 49.0M/s | 0.57     |
+| mixed                     | 6.9 ns · 144M/s   | 10.0 ns · 99.6M/s | 1.40     |
+
 
 **Key Metrics:**
 - **Sub-microsecond latencies** for all operations
-- **620M+ ops/sec** total throughput
-- **Cache-optimized storage** sized to fit entirely in L3 cache
+- **Cache-optimized storage** sized to fit entirely in L3 cache, while permitting larger capacities
 
 ## Architecture
 
@@ -53,21 +68,24 @@ WILD leverages modern CPU architecture for extreme performance:
 
 ## Security & Authentication
 
-WILD includes a simple authentication system:
+The server reads the first message on every connection as the shared secret and
+answers with one byte. `wild-client` sends it for you:
 
 ```bash
-# Start database with authentication required
+# Server: authentication required
 ./zig-out/bin/wild --auth-secret "your-secure-secret-here" --port 7878
 
-# All clients must authenticate
-./zig-out/bin/wild-client-example --auth-secret "your-secure-secret-here"
+# Client: pass the secret, or set WILD_AUTH_SECRET
+./zig-out/bin/wild-client --auth-secret "your-secure-secret-here" 127.0.0.1:7878 get name
+WILD_AUTH_SECRET="your-secure-secret-here" ./zig-out/bin/wild-client 127.0.0.1:7878 get name
 ```
 
-**Security Features:**
-- Shared secret authentication for all connections
-- Timing-attack resistant
-- Replication authentication
-- Connection-level access control
+**How it behaves:**
+- With `--auth-secret`, a client that sends no secret, or the wrong one, is
+  refused. The secret comparison is constant-time.
+- Without `--auth-secret`, authentication is off and every message is a command.
+  That is the mode to use on a loopback interface for local work.
+- Replication between nodes always needs a secret, and it needs `--enable-wal`.
 
 See [docs/SECURITY.md](docs/SECURITY.md) for detailed security information.
 
@@ -142,20 +160,28 @@ See [docs/REPLICATION.md](docs/REPLICATION.md) for replication setup and managem
 
 ### Client Usage
 ```bash
-# Health check
+# Key-value operations. The value goes to stdout, everything else to stderr.
+./zig-out/bin/wild-client 127.0.0.1:7878 set name "John Doe"
+./zig-out/bin/wild-client 127.0.0.1:7878 get name
+./zig-out/bin/wild-client 127.0.0.1:7878 delete name
+
+# Against a server that has a secret
+./zig-out/bin/wild-client --auth-secret s3cret 127.0.0.1:7878 get name
+
+# Example and end-to-end programs
 ./zig-out/bin/wild-client-example health
-
-# Load testing
-./zig-out/bin/wild-client-example load-test
-
-# Replication testing
-./zig-out/bin/wild-client-example replication-test
+./zig-out/bin/e2e-server 7878 testsecret &
+./zig-out/bin/e2e-client 127.0.0.1:7878 testsecret
 ```
+
+`wild-client` exit status: `0` success, `1` the request failed, `2` bad usage.
+So a shell script can trust it.
 
 ## 🛠️ Build & Installation
 
 ### Prerequisites
-- Zig 0.14+
+- Zig 0.17.0 — the code needs `std.Io`, so it does not build on 0.14 or 0.15.
+  See `docs/MIGRATION_0.17.md`.
 - Linux x86-64 (other platforms unsupported, PRs welcome)
 - CPU with L3 cache (more cache = higher capacity)
   - Storage space sizing is based on 75% of available L3 cache, divided by one cache line (64 bytes) then rounded down to the largest power of two that fits.
@@ -170,22 +196,39 @@ zig build
 zig build -Doptimize=ReleaseFast
 
 # Available binaries after build:
-# - ./zig-out/bin/wild              (main database daemon)
+# - ./zig-out/bin/wild                (database daemon and client server)
+# - ./zig-out/bin/wild-client         (command line client)
 # - ./zig-out/bin/wild-client-example (example client)
+# - ./zig-out/bin/benchmark           (throughput benchmark)
+# - ./zig-out/bin/e2e-server          (real server, for the end-to-end test)
+# - ./zig-out/bin/e2e-client          (drives e2e-server over TCP)
+# - ./zig-out/bin/e2e-concurrency     (disconnects must not steal another
+#                                      connection's answer)
+# - ./zig-out/bin/e2e-pipelined       (256 connections served from batched
+#                                      lookups)
 ```
 
 ### Testing
 ```bash
-# Run performance benchmarks
-zig run quick_benchmark.zig -O ReleaseFast
-zig run performance_benchmark.zig -O ReleaseFast
+# The green light: build, 18 unit tests, deep type-check, four end-to-end tests
+./scripts/verify
 
-# Test replication
-zig run replication_test.zig -O ReleaseFast
+# Fast loop while you work: the same without the ReleaseFast build
+./scripts/test
 
-# Test recovery
-zig run recovery_benchmark.zig -O ReleaseFast
+# Throughput, at a table that fits in L3 and one that does not
+zig build -Doptimize=ReleaseFast
+./zig-out/bin/benchmark --compare
+
+# How many keys the server groups per drain, and what fill fraction costs
+./zig-out/bin/e2e-pipelined
+./zig-out/bin/benchmark --mode probes --load-factor 0.95 --capacity 8388608
 ```
+
+Batch reads prefetch the home cache line of every key in a group, which is
+35% faster per key than a plain loop when the table is larger than L3. The
+server groups the requests that arrive together and looks them up in one batch.
+Measurements, and the limits of both claims: [docs/bench/README.md](bench/README.md).
 
 ## Documentation
 
