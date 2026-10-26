@@ -33,6 +33,31 @@ const WALEntry = extern struct {
 };
 ```
 
+The `metadata` word carries three fields. Bit 31 marks a real entry. Bits 0 to 5
+hold the value length. Bit 6 marks a delete.
+
+| Bit 31 | Bit 6 | Meaning |
+|---|---|---|
+| 0 | 0 | Empty slot. Not an entry. The space between batches in a batch block. |
+| 1 | 0 | Write. Store `data[0..length]` under `key`. |
+| 1 | 1 | Delete. Remove `key`. The length and the payload are ignored. |
+
+A delete cannot be a length-0 write, because storing an empty value is legal and
+reads back the same way. It needs its own bit.
+
+Bit 6 was previously part of 25 unused, reserved bits. That keeps old WAL files
+readable: an entry written before deletes existed has 0 there, so it still reads
+as a write. There is no format version to bump, and no WAL file needs migration.
+
+A delete marker appears in the log only. A live table never holds one, because
+bit 31 is set on it, and an occupied slot that no lookup can reach is the fault
+that `FlatHashStorage.delete` exists to prevent.
+
+`FlatHashStorage.applyEntry` is the only place that reads these bits. Three
+readers call it: WAL replay in `snapshot.zig`, snapshot restore, and replica
+apply in `replication.zig`. A reader that applies an entry as a write without
+checking bit 6 brings back the key the delete removed.
+
 ### 2. Batched WAL Format
 
 Operations are batched into 2KB blocks for efficient disk I/O and network replication:

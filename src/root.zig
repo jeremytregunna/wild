@@ -28,6 +28,12 @@ pub const client = @import("client.zig");
 pub const static_allocator = @import("static_allocator.zig");
 pub const os_compat = @import("os_compat.zig");
 
+// Re-export durability and recovery. A WAL entry is a mirror of a cache-line
+// record, so a test that pins the entry format needs both sides of it: the
+// writer in wal.zig and the reader in snapshot.zig.
+pub const wal = @import("wal.zig");
+pub const snapshot = @import("snapshot.zig");
+
 test "cache topology analysis" {
     const allocator = std.testing.allocator;
 

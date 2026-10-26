@@ -866,7 +866,10 @@ pub const ReplicaNode = struct {
             const record_bytes = snapshot_data[offset .. offset + @sizeOf(flat_hash_storage.CacheLineRecord)];
             const record = std.mem.bytesToValue(flat_hash_storage.CacheLineRecord, record_bytes);
 
-            if (record.isValid()) {
+            // A marker is never valid snapshot contents, so a bootstrap that
+            // carries one is corrupt. Skip it rather than store an occupied
+            // slot that no probe can reach.
+            if (record.isValid() and !record.isDelete()) {
                 const key = record.getKey();
                 const data = record.getData();
 
@@ -935,12 +938,12 @@ pub const ReplicaNode = struct {
         // Apply each entry in the batch to our local database
         for (batch.entries[0..batch.entry_count]) |*entry| {
             if (entry.isValid()) {
-                const key = entry.getKey();
-                const data = entry.getData();
-
-                // Apply the write operation to our replica
-                self.database.write(key, data) catch {
-                    // On write failure, increment error counter and continue
+                // A write stores the value and a marker removes the key, which
+                // is the same rule replay follows. Applied straight as a write,
+                // a marker would resurrect the key on this replica while the
+                // primary had it gone.
+                self.database.storage.applyEntry(entry) catch {
+                    // On failure, increment error counter and continue
                     _ = self.connection_errors.fetchAdd(1, .monotonic);
                     continue;
                 };

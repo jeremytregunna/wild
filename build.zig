@@ -264,6 +264,21 @@ pub fn build(b: *std.Build) void {
 
     const run_batch_read_unit_tests = b.addRunArtifact(batch_read_unit_tests);
 
+    // A delete has to survive a crash. These pin the WAL entry that carries a
+    // delete, and the readers that must honour it.
+    const wal_delete_test_mod = b.createModule(.{
+        .root_source_file = b.path("tests/test_wal_delete.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    wal_delete_test_mod.addImport("wildb_lib", lib_mod);
+
+    const wal_delete_unit_tests = b.addTest(.{
+        .root_module = wal_delete_test_mod,
+    });
+
+    const run_wal_delete_unit_tests = b.addRunArtifact(wal_delete_unit_tests);
+
     // Similar to creating the run step earlier, this exposes a `test` step to
     // the `zig build --help` menu, providing a way for the user to request
     // running the unit tests.
@@ -274,6 +289,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_slab_unit_tests.step);
     test_step.dependOn(&run_storage_unit_tests.step);
     test_step.dependOn(&run_batch_read_unit_tests.step);
+    test_step.dependOn(&run_wal_delete_unit_tests.step);
 
     // Zig analyses code lazily: a function nothing calls is never type-checked.
     // deep_check_main.zig references every public declaration, so the compiler

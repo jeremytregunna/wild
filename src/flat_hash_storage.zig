@@ -11,6 +11,18 @@ pub const CacheLineRecord = extern struct {
     const Self = @This();
     pub const VALID_FLAG: u32 = 1 << 31; // Use top bit for valid flag
     pub const LENGTH_MASK: u32 = 0x3F; // Bottom 6 bits for length (0-63, enough for 52)
+    /// Marks a record as a removal rather than a stored value.
+    ///
+    /// A delete cannot be encoded as a length-0 record, because storing an
+    /// empty value is legal and reads back as one. It needs a bit of its own.
+    /// Bits 6 to 30 of `metadata` were unused, so this takes bit 6, which is
+    /// what keeps WAL files written before it readable: such a record has 0
+    /// here and still reads as a write.
+    ///
+    /// A marker belongs in the log only. A live table never holds one,
+    /// because `isValid` reports true for it, and an occupied slot that no
+    /// probe can reach is exactly the failure `FlatHashStorage.delete` fixes.
+    pub const DELETE_FLAG: u32 = 1 << 6;
 
     pub fn init(key: u64, data: []const u8) !Self {
         if (data.len > 52) return error.DataTooLarge;
@@ -31,6 +43,27 @@ pub const CacheLineRecord = extern struct {
             .key = 0,
             .data = std.mem.zeroes([52]u8),
         };
+    }
+
+    /// The record that says "remove `key`", for the log only.
+    ///
+    /// The length is 0 and the payload is zeroed: a delete carries a key and
+    /// nothing else. `FlatHashStorage.applyEntry` reads the key and ignores
+    /// the payload.
+    pub fn initDelete(key: u64) Self {
+        return Self{
+            .metadata = VALID_FLAG | DELETE_FLAG,
+            .key = key,
+            .data = std.mem.zeroes([52]u8),
+        };
+    }
+
+    /// Whether this record is a delete marker rather than a stored value.
+    ///
+    /// Meaningful only alongside `isValid`: a record that is neither valid nor
+    /// marked is the gap left between batches in a WAL, not an entry.
+    pub fn isDelete(self: *const Self) bool {
+        return (self.metadata & DELETE_FLAG) != 0;
     }
 
     pub fn isValid(self: *const Self) bool {
@@ -389,7 +422,35 @@ pub const FlatHashStorage = struct {
         const pos = self.findRecord(key) orelse return false;
         self.closeRun(pos);
         self.count -= 1;
+
+        // The removal has to reach the log. Without this entry the next replay
+        // re-applies the write that put the key there, and the key comes back.
+        // Same async policy as `write`: a full ring drops the entry and the
+        // delete still stands in memory.
+        if (self.durability_manager) |dur_mgr| {
+            const marker = CacheLineRecord.initDelete(key);
+            _ = dur_mgr.appendAsync(&marker);
+        }
+
         return true;
+    }
+
+    /// Apply one WAL entry: a write stores the value, a marker removes the key.
+    ///
+    /// This is the only place WAL entry metadata is interpreted. Replay,
+    /// snapshot restore and replica apply all route here, so the three cannot
+    /// drift apart over what a marker means.
+    ///
+    /// Removing a key that is not present is not an error. A replica that
+    /// bootstrapped from a snapshot legitimately sees deletes for keys that
+    /// snapshot already settled, and replay sees a delete for a key that was
+    /// never in the table.
+    pub fn applyEntry(self: *Self, entry: *const wal.WALEntry) !void {
+        if (entry.isDelete()) {
+            _ = self.delete(entry.getKey());
+            return;
+        }
+        try self.write(entry.getKey(), entry.getData());
     }
 
     /// Shift the records after `hole` back by one slot, then clear the last one.
@@ -464,13 +525,23 @@ pub const FlatHashStorage = struct {
     pub fn restoreRecord(self: *Self, record: *const CacheLineRecord) !void {
         if (!record.isValid()) return;
 
+        // A snapshot is a copy of the live table, so a marker in one means the
+        // snapshot is corrupt. Storing it would occupy a slot that no probe can
+        // reach, because isValid reports true for a marker.
+        if (record.isDelete()) return;
+
         // Find the correct position for this record
         const key = record.getKey();
         const pos = self.findEmptySlot(key) orelse return error.TableFull;
 
+        // Restoring a key the table already holds updates that slot, so the
+        // count must not move. A replay that covers keys already present would
+        // otherwise inflate the count and with it the load factor.
+        const is_update = self.records[pos].isValid() and self.records[pos].key == key;
+
         // Restore the record
         self.records[pos] = record.*;
-        self.count += 1;
+        if (!is_update) self.count += 1;
     }
 
     // Get record at specific slot index (for snapshot creation)

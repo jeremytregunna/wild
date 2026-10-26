@@ -238,9 +238,12 @@ pub const SnapshotFile = struct {
         // Clear current storage
         storage.clear();
 
-        // Copy all valid records from snapshot
+        // Copy all valid records from snapshot. A marker is never a valid
+        // snapshot contents: a snapshot copies the live table, and the live
+        // table holds no markers. Refusing one here keeps a corrupt snapshot
+        // from occupying a slot that no probe can reach.
         for (self.records) |*record| {
-            if (record.isValid()) {
+            if (record.isValid() and !record.isDelete()) {
                 try storage.restoreRecord(record);
             }
         }
@@ -482,13 +485,13 @@ pub const WALReplayer = struct {
             // Replay entries in this batch
             for (batch.entries[0..batch.entry_count]) |*entry| {
                 if (entry.isValid()) {
-                    // Convert WAL entry back to storage record format
-                    const key = entry.getKey();
-                    const data = entry.getData();
-
-                    // Apply the write operation
-                    storage.write(key, data) catch |err| {
-                        std.debug.print("WAL replay: failed to replay entry key={}: {}\n", .{ key, err });
+                    // A write stores the value and a marker removes the key.
+                    // Both live in applyEntry so that replay, snapshot restore
+                    // and replica apply cannot disagree about a marker. Read
+                    // straight as a write, a marker would resurrect the key it
+                    // deleted, as an empty value.
+                    storage.applyEntry(entry) catch |err| {
+                        std.debug.print("WAL replay: failed to replay entry key={}: {}\n", .{ entry.getKey(), err });
                         // Continue with other entries
                         continue;
                     };

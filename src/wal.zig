@@ -26,6 +26,16 @@ pub const WALEntry = extern struct {
         return (self.metadata & flat_hash_storage.CacheLineRecord.VALID_FLAG) != 0;
     }
 
+    /// Whether this entry removes a key instead of storing one.
+    ///
+    /// A marker is still a valid entry. `isValid` answers "is this a real
+    /// entry", which is what the batch walkers ask, and a delete is a real
+    /// entry. Readers that act on the entry must ask this question too, or a
+    /// marker is applied as a write of an empty value and resurrects the key.
+    pub fn isDelete(self: *const Self) bool {
+        return (self.metadata & flat_hash_storage.CacheLineRecord.DELETE_FLAG) != 0;
+    }
+
     pub fn getKey(self: *const Self) u64 {
         return self.key;
     }
