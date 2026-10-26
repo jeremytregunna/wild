@@ -37,6 +37,12 @@ pub const CacheLineRecord = extern struct {
         return (self.metadata & VALID_FLAG) != 0;
     }
 
+    /// Clear the valid bit on this record, in place.
+    ///
+    /// This is the record-level primitive only. Clearing one slot of an open
+    /// table is not a delete: it leaves a hole that ends every probe chain
+    /// running through it, which strands the keys behind it. Call
+    /// `FlatHashStorage.delete`, which closes the run.
     pub fn markInvalid(self: *Self) void {
         self.metadata &= ~VALID_FLAG;
     }
@@ -359,17 +365,74 @@ pub const FlatHashStorage = struct {
         }
     }
 
-    pub inline fn delete(self: *Self, key: u64) bool {
+    /// Remove a key, closing the hole it leaves so that later keys in the same
+    /// probe run stay reachable.
+    ///
+    /// Linear probing puts a colliding key in the next free slot, and a lookup
+    /// stops at the first empty slot it meets. Clearing one slot in the middle
+    /// of a run therefore hides every key behind it: the value bytes stay in
+    /// the table, but no probe can reach them. So the records after the hole
+    /// are shifted back, one slot at a time, until the run ends.
+    ///
+    /// This keeps the only two states the table has, occupied or empty, which
+    /// is what `copyAllRecords`, the snapshot and replication walkers, and the
+    /// WAL entry format already read. A tombstone state would add a third
+    /// state to all of those, and nothing here grows or rehashes the table, so
+    /// tombstones would never be reclaimed.
+    ///
+    /// Cost: a delete walks its own run, so it costs O(run length) instead of
+    /// O(1). Reads are untouched, and an in-run read still costs one cache
+    /// line.
+    ///
+    /// Returns false when the key is not present.
+    pub fn delete(self: *Self, key: u64) bool {
         const pos = self.findRecord(key) orelse return false;
-
-        // Mark record as invalid
-        self.records[pos].markInvalid();
+        self.closeRun(pos);
         self.count -= 1;
-
-        // Important: We don't compact the table to maintain O(1) performance
-        // The slot remains "tombstoned" until overwritten by a new record
-
         return true;
+    }
+
+    /// Shift the records after `hole` back by one slot, then clear the last one.
+    ///
+    /// A record moves only when its home slot sits at or before the hole in
+    /// probe order, which is what makes the record's placement depend on that
+    /// slot being occupied. The first record whose probe started at or after
+    /// the hole stays where it is, and the scan continues past it: a later
+    /// record in the same run can still depend on the hole.
+    ///
+    /// The scan is bounded by `capacity` rather than by the first empty slot,
+    /// because a table that reached 100 percent has no empty slot to stop at
+    /// until this function clears one.
+    fn closeRun(self: *Self, hole: u32) void {
+        const mask = self.capacity - 1;
+        var hole_pos = hole;
+        var probe = (hole + 1) & mask;
+        var steps: u32 = 0;
+
+        while (self.records[probe].isValid() and steps < self.capacity) : (steps += 1) {
+            const home = @as(u32, @intCast(hashKey(self.records[probe].key) & mask));
+
+            if (Self.dependsOnHole(hole_pos, probe, home)) {
+                self.records[hole_pos] = self.records[probe];
+                hole_pos = probe;
+            }
+            probe = (probe + 1) & mask;
+        }
+
+        self.records[hole_pos] = CacheLineRecord.initEmpty();
+    }
+
+    /// Whether the record sitting at `probe` had to probe past `hole` to get
+    /// there, given that its home slot is `home`.
+    ///
+    /// The record did not depend on `hole` exactly when `home` lies in the
+    /// circular interval `(hole, probe]`: its probe path then started at or
+    /// after the hole and never crossed it. Checked at the boundary that
+    /// matters: `home == probe` means the record is already on its home slot
+    /// and must not move, and `home == hole` means it belongs in the hole.
+    inline fn dependsOnHole(hole: u32, probe: u32, home: u32) bool {
+        if (hole <= probe) return !(home > hole and home <= probe);
+        return !(home > hole or home <= probe); // the probe path wrapped
     }
 
     pub fn clear(self: *Self) void {
