@@ -3,6 +3,7 @@ const os_compat = @import("os_compat.zig");
 const wild = @import("wild.zig");
 const wal = @import("wal.zig");
 const flat_hash_storage = @import("flat_hash_storage.zig");
+const table_set = @import("table_set.zig");
 const static_allocator = @import("static_allocator.zig");
 
 // View-based replication system for WILD database
@@ -149,7 +150,7 @@ pub const PrimaryReplicator = struct {
     auth_secret: []const u8,
 
     // Reference to database storage for snapshot creation
-    database_storage: *flat_hash_storage.FlatHashStorage,
+    database_storage: *table_set.TableSet,
 
     // Scratch space for a bootstrap snapshot, allocated before the static
     // allocator freezes. A bootstrap used to allocate the whole table on the
@@ -171,7 +172,7 @@ pub const PrimaryReplicator = struct {
     const LAG_CHECK_INTERVAL_MS = 10000; // 10 seconds
     const MAX_LAG_BATCHES = 100; // Maximum batches a replica can lag behind
 
-    pub fn init(allocator: std.mem.Allocator, wal_manager: *wal.DurabilityManager, database_storage: *flat_hash_storage.FlatHashStorage, listen_port: u16, auth_secret: []const u8) !Self {
+    pub fn init(allocator: std.mem.Allocator, wal_manager: *wal.DurabilityManager, database_storage: *table_set.TableSet, listen_port: u16, auth_secret: []const u8) !Self {
         // Create listening socket for replica connections
         const listen_fd = try os_compat.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
         try std.posix.setsockopt(listen_fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
@@ -876,7 +877,7 @@ pub const ReplicaNode = struct {
         // Snapshot data is a packed sequence of cache-line records. Applying it
         // through the storage guard makes the whole chunk one critical section,
         // so a client cannot observe half a bootstrap.
-        _ = self.database.storage.applySnapshotBytes(snapshot_data);
+        _ = self.database.tables.applySnapshotBytes(snapshot_data);
 
         // Update our sequence tracking
         _ = sequence_id; // For now, just acknowledge receipt
@@ -939,7 +940,7 @@ pub const ReplicaNode = struct {
             if (entry.isValid()) valid += 1;
         }
 
-        const applied = self.database.storage.applyEntries(entries);
+        const applied = self.database.tables.applyEntries(entries);
         if (applied < valid) {
             _ = self.connection_errors.fetchAdd(valid - applied, .monotonic);
         }

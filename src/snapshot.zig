@@ -1,6 +1,7 @@
 const std = @import("std");
 const os_compat = @import("os_compat.zig");
 const flat_hash_storage = @import("flat_hash_storage.zig");
+const table_set = @import("table_set.zig");
 const wal = @import("wal.zig");
 
 // Snapshot file format for WILD database recovery
@@ -103,7 +104,7 @@ pub const SnapshotFile = struct {
     const Self = @This();
 
     // Create a new snapshot from current database state
-    pub fn create(file_path: []const u8, storage: *const flat_hash_storage.FlatHashStorage, current_wal_position: u64) !Self {
+    pub fn create(file_path: []const u8, storage: *const table_set.TableSet, current_wal_position: u64) !Self {
         const storage_stats = storage.getStats();
 
         // Calculate total file size (header + records, page-aligned)
@@ -228,7 +229,7 @@ pub const SnapshotFile = struct {
     }
 
     // Restore database state from this snapshot
-    pub fn restoreToStorage(self: *const Self, storage: *flat_hash_storage.FlatHashStorage) !void {
+    pub fn restoreToStorage(self: *const Self, storage: *table_set.TableSet) !void {
         // Verify capacities match
         const storage_stats = storage.getStats();
         if (storage_stats.total_capacity != self.header.total_capacity) {
@@ -306,7 +307,7 @@ pub const SnapshotManager = struct {
     }
 
     // Create a new snapshot of current database state
-    pub fn createSnapshot(self: *Self, storage: *const flat_hash_storage.FlatHashStorage, current_wal_position: u64) !void {
+    pub fn createSnapshot(self: *Self, storage: *const table_set.TableSet, current_wal_position: u64) !void {
         const snapshot_id = self.snapshot_counter.fetchAdd(1, .monotonic);
 
         // Generate snapshot filename
@@ -441,7 +442,7 @@ pub const WALReplayer = struct {
     }
 
     // Replay WAL entries from a specific position to recover database state
-    pub fn replayFromPosition(self: *Self, storage: *flat_hash_storage.FlatHashStorage, start_position: u64, end_position: ?u64) !u64 {
+    pub fn replayFromPosition(self: *Self, storage: *table_set.TableSet, start_position: u64, end_position: ?u64) !u64 {
         const file = os_compat.openFile(self.wal_file_path, .{ .mode = .read_only }) catch |err| switch (err) {
             error.FileNotFound => {
                 std.debug.print("WAL file not found, no replay needed\n", .{});
@@ -584,7 +585,7 @@ pub const RecoveryCoordinator = struct {
     }
 
     // Perform complete crash recovery: load latest snapshot + replay WAL
-    pub fn performRecovery(self: *Self, storage: *flat_hash_storage.FlatHashStorage) !u64 {
+    pub fn performRecovery(self: *Self, storage: *table_set.TableSet) !u64 {
         std.debug.print("=== Starting WILD Database Recovery ===\n", .{});
 
         // Step 1: Try to load the latest snapshot

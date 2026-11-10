@@ -39,6 +39,16 @@ const Op = union(enum) {
     write: struct { key: u64, data: []const u8 },
     delete: u64,
     apply: *const wal.WALEntry,
+    /// A whole batch. Each owner takes one critical section and keeps only the
+    /// entries its keys route to it, so a reader never sees half of a batch
+    /// that belongs to the table it is reading.
+    apply_batch: struct { entries: []const wal.WALEntry, index: u16, count: u16 },
+    /// A bootstrap snapshot's bytes. Each owner walks the payload and takes
+    /// only its own records; with two tables that is two passes over the
+    /// payload instead of one, which is cheaper than allocating a per-table
+    /// copy after init.
+    apply_snapshot_bytes: struct { bytes: []const u8, index: u16, count: u16 },
+    restore_record: *const CacheLineRecord,
     clear: void,
 };
 
@@ -52,6 +62,7 @@ const Request = struct {
     err: ?anyerror = null,
     read: ?*const CacheLineRecord = null,
     deleted: bool = false,
+    applied: usize = 0,
 };
 
 /// One zone's table and the thread that owns it.
@@ -136,6 +147,11 @@ pub const Table = struct {
             },
             .delete => |key| request.deleted = self.storage.delete(key),
             .apply => |entry| self.storage.applyEntry(entry) catch |err| {
+                request.err = err;
+            },
+            .apply_batch => |batch| request.applied = self.storage.applyEntriesRouted(batch.entries, batch.index, batch.count),
+            .apply_snapshot_bytes => |snapshot| request.applied = self.storage.applySnapshotBytesRouted(snapshot.bytes, snapshot.index, snapshot.count),
+            .restore_record => |record| self.storage.restoreRecord(record) catch |err| {
                 request.err = err;
             },
             .clear => self.storage.clear(),
@@ -495,7 +511,7 @@ pub const TableSet = struct {
     /// Copy every table's records into `out`, table after table, each into its
     /// own capacity-sized slot. The slot boundaries are recomputed with
     /// `capacityOf`, so a snapshot does not have to store them.
-    pub fn copyAllRecords(self: *Self, out: []CacheLineRecord) void {
+    pub fn copyAllRecords(self: *const Self, out: []CacheLineRecord) void {
         std.debug.assert(out.len == self.totalCapacity());
 
         var offset: usize = 0;
@@ -537,6 +553,131 @@ pub const TableSet = struct {
             .placed = placed,
             .pinned = pinned,
         };
+    }
+
+    /// Apply a batch of log entries, one owner per table.
+    ///
+    /// Each table's slice is applied in a single critical section, so readers
+    /// of that table see the batch whole. A batch whose keys span two tables
+    /// is therefore two critical sections, not one: the tables are independent
+    /// and nothing orders them against each other. That was already true of
+    /// two clients writing concurrently before partitioning existed, and it is
+    /// the price of keeping writes inside their zones.
+    ///
+    /// Returns how many entries were applied, across all tables.
+    pub fn applyEntries(self: *Self, entries: []const wal.WALEntry) usize {
+        if (self.tables.len == 1) return self.tables[0].storage.applyEntries(entries);
+
+        // Split by routing, but only in the requests: each owner filters the
+        // batch by the same rule, so no caller allocates a per-table copy.
+        var applied: usize = 0;
+        for (self.tables) |*table| {
+            var request = Request{ .op = .{ .apply_batch = .{ .entries = entries, .index = table.id, .count = self.count() } } };
+            if (table.hasOwner()) {
+                table.push(&request);
+                table.wait(&request);
+                applied += request.applied;
+            } else {
+                applied += table.storage.applyEntriesRouted(entries, table.id, self.count());
+            }
+        }
+        return applied;
+    }
+
+    /// Apply a primary's bootstrap snapshot. Each owner takes the records whose
+    /// keys route to it and skips the rest.
+    pub fn applySnapshotBytes(self: *Self, bytes: []const u8) usize {
+        if (self.tables.len == 1) return self.tables[0].storage.applySnapshotBytes(bytes);
+
+        var applied: usize = 0;
+        for (self.tables) |*table| {
+            var request = Request{ .op = .{ .apply_snapshot_bytes = .{ .bytes = bytes, .index = table.id, .count = self.count() } } };
+            if (table.hasOwner()) {
+                table.push(&request);
+                table.wait(&request);
+                applied += request.applied;
+            } else {
+                applied += table.storage.applySnapshotBytesRouted(bytes, table.id, self.count());
+            }
+        }
+        return applied;
+    }
+
+    /// Restore one record from a snapshot file, into the table that owns its
+    /// key. A snapshot is a copy of the whole database, so its slots belong to
+    /// whichever table routing assigns them to now.
+    pub fn restoreRecord(self: *Self, record: *const CacheLineRecord) !void {
+        const table = self.tableFor(record.getKey());
+        if (!table.hasOwner()) return table.storage.restoreRecord(record);
+
+        var request = Request{ .op = .{ .restore_record = record } };
+        table.push(&request);
+        table.wait(&request);
+        if (request.err) |err| return err;
+    }
+
+    /// The storage statistics the snapshot header, the recovery path and
+    /// replication all read: one table's worth of numbers, summed.
+    pub fn getStats(self: *const Self) flat_hash_storage.StorageStats {
+        const summed = self.stats();
+        return .{
+            .total_count = summed.used_capacity,
+            .total_capacity = summed.total_capacity,
+            .load_factor = summed.load_factor,
+            .l3_domains = @intCast(self.tables.len),
+        };
+    }
+
+    /// Batch read through the owning threads. The pipelined prefetch path only
+    /// exists for the one-table case: with owners, each table would have to be
+    /// prefetched by its own thread, which is a different change.
+    pub fn readBatchPipelined(self: *Self, keys: []const u64, results: []?*const CacheLineRecord, comptime micro: usize) usize {
+        if (self.tables.len == 1) return self.tables[0].storage.readBatchPipelined(keys, results, micro);
+
+        self.readBatch(keys, results);
+        var hits: usize = 0;
+        for (results) |result| {
+            if (result != null) hits += 1;
+        }
+        return hits;
+    }
+
+    /// One line per table: where it is, what zone it claims, and how full it
+    /// is. `node` is the kernel's number and `zone` the hardware's, and they
+    /// can differ.
+    pub fn printDetailedStats(self: *const Self) void {
+        for (self.tables) |table| {
+            const zone = if (table.domain) |domain| domain.node_id else null;
+            std.debug.print(
+                "Table {d}: {d}/{d} records, zone {?d}, kernel node {?d}, placed {}, pinned {}\n",
+                .{
+                    table.id,
+                    table.storage.count,
+                    table.storage.capacity,
+                    zone,
+                    table.memory_node,
+                    table.bound,
+                    table.pinned,
+                },
+            );
+        }
+    }
+
+    /// Walk one key's probe chain length, through the owning table. A
+    /// read-only probe; the benchmark uses it to measure clustering.
+    pub fn probeLength(self: *const Self, key: u64) ?u32 {
+        return self.tableFor(key).storage.probeLength(key);
+    }
+
+    /// The record at a physical slot of table 0.
+    ///
+    /// For the layout tests that check where a record physically ended up.
+    /// Meaningful only with one table, which is what those tests build: with
+    /// several, a slot number alone does not say which table it belongs to
+    /// and this returns null instead of guessing.
+    pub fn getRecordAtSlot(self: *const Self, slot: u32) ?*const CacheLineRecord {
+        if (self.tables.len != 1) return null;
+        return self.tables[0].storage.getRecordAtSlot(slot);
     }
 
     pub fn enableSync(self: *Self) void {

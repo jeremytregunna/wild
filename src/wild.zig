@@ -5,13 +5,16 @@ const static_allocator = @import("static_allocator.zig");
 const wal = @import("wal.zig");
 const snapshot = @import("snapshot.zig");
 const replication = @import("replication.zig");
+const table_set = @import("table_set.zig");
 
 // WILD Database - Cache-Resident Ultra-High-Performance Key-Value Store
 pub const WILD = struct {
     const Self = @This();
 
-    // Core storage engine
-    storage: flat_hash_storage.FlatHashStorage,
+    // Core storage engine: one table per NUMA zone, each owned by a thread
+    // pinned to its zone. A machine that proves one zone gets one table and no
+    // owner thread, which is the path this store has always run.
+    tables: table_set.TableSet,
     cache_topology: *cache_topology.CacheTopology,
     allocator: std.mem.Allocator,
 
@@ -30,6 +33,10 @@ pub const WILD = struct {
 
     pub const Config = struct {
         target_capacity: u64,
+        /// Force a table count instead of taking the zone count. Only tests
+        /// use it: a one-zone machine cannot exercise the multi-table path
+        /// otherwise, and that path is where a placement bug would hide.
+        partition_override: ?u16 = null,
     };
 
     pub const Stats = struct {
@@ -50,13 +57,14 @@ pub const WILD = struct {
         const topology_ptr = try allocator.create(cache_topology.CacheTopology);
         topology_ptr.* = try cache_topology.analyzeCacheTopology(allocator);
 
-        // Initialize flat hash storage using static allocator
-        const storage = try flat_hash_storage.FlatHashStorage.init(allocator, topology_ptr, config.target_capacity);
+        // One table per zone, placed on its zone's memory and owned by a
+        // thread pinned there. One zone means one table and no owner thread.
+        const tables = try table_set.TableSet.init(allocator, topology_ptr, config.target_capacity, config.partition_override);
 
         // Note: Caller will transition static allocator to static state after init
 
         return Self{
-            .storage = storage,
+            .tables = tables,
             .cache_topology = topology_ptr,
             .allocator = allocator,
             .durability = null, // Initially no WAL
@@ -90,7 +98,7 @@ pub const WILD = struct {
         }
 
         // 4. Storage cleanup - core data structures, no dependencies
-        self.storage.deinit();
+        self.tables.deinit();
         self.cache_topology.deinit();
         self.allocator.destroy(self.cache_topology);
 
@@ -99,19 +107,19 @@ pub const WILD = struct {
 
     // Core single operations - no stats overhead
     pub inline fn read(self: *Self, key: u64) !?*const flat_hash_storage.CacheLineRecord {
-        return self.storage.read(key);
+        return self.tables.read(key);
     }
 
     pub inline fn write(self: *Self, key: u64, data: []const u8) !void {
-        try self.storage.write(key, data);
+        try self.tables.write(key, data);
     }
 
     pub inline fn delete(self: *Self, key: u64) !bool {
-        return self.storage.delete(key);
+        return self.tables.delete(key);
     }
 
     pub inline fn clear(self: *Self) void {
-        self.storage.clear();
+        self.tables.clear();
     }
 
     // Batch operations for maximum performance - caller must provide result array
@@ -133,7 +141,7 @@ pub const WILD = struct {
         std.debug.assert(keys.len == results.len);
 
         if (keys.len >= pipelined_threshold) {
-            _ = self.storage.readBatchPipelined(keys, results, default_microbatch);
+            _ = self.tables.readBatchPipelined(keys, results, default_microbatch);
             return;
         }
 
@@ -148,7 +156,7 @@ pub const WILD = struct {
     pub fn readBatchSimple(self: *Self, keys: []const u64, results: []?*const flat_hash_storage.CacheLineRecord) void {
         std.debug.assert(keys.len == results.len);
         for (keys, 0..) |key, i| {
-            results[i] = self.storage.read(key);
+            results[i] = self.tables.read(key) catch null;
         }
     }
 
@@ -161,26 +169,20 @@ pub const WILD = struct {
         comptime micro: usize,
     ) usize {
         std.debug.assert(keys.len == results.len);
-        return self.storage.readBatchPipelined(keys, results, micro);
+        return self.tables.readBatchPipelined(keys, results, micro);
     }
 
     // Simplified write batch - no complex batching needed with cache-line approach
     pub fn writeBatch(self: *Self, keys: []const u64, data_items: []const []const u8) !void {
         std.debug.assert(keys.len == data_items.len);
 
-        // Simple loop over writes
-        for (keys, data_items) |key, data| {
-            try self.storage.write(key, data);
-        }
+        try self.tables.writeBatch(keys, data_items);
     }
 
     pub fn deleteBatch(self: *Self, keys: []const u64) ![]bool {
         const results = try self.allocator.alloc(bool, keys.len);
 
-        for (keys, 0..) |key, i| {
-            results[i] = self.storage.delete(key);
-        }
-
+        try self.tables.deleteBatch(keys, results);
         return results;
     }
 
@@ -210,7 +212,7 @@ pub const WILD = struct {
 
     // Basic statistics - no timing overhead
     pub fn getStats(self: *const Self) Stats {
-        const storage_stats = self.storage.getStats();
+        const storage_stats = self.tables.getStats();
 
         return Stats{
             .load_factor = storage_stats.load_factor,
@@ -227,7 +229,7 @@ pub const WILD = struct {
         const stats = self.getStats();
 
         // Print storage details first
-        self.storage.printDetailedStats();
+        self.tables.printDetailedStats();
 
         std.debug.print("\n=== WILD Hardware Report ===\n", .{});
         std.debug.print("Hardware Configuration:\n", .{});
@@ -253,8 +255,9 @@ pub const WILD = struct {
         // Initialize durability manager using static allocator
         self.durability = try wal.DurabilityManager.init(self.allocator, wal_config);
 
-        // Associate WAL with storage
-        self.storage.enableDurability(&self.durability.?);
+        // Associate WAL with every table: an entry carries a key, and the key
+        // decides the table again on replay.
+        self.tables.enableDurability(&self.durability.?);
 
         // Start durability thread
         try self.durability.?.start();
@@ -262,7 +265,7 @@ pub const WILD = struct {
 
     // Convenience method: enable durability with properly sized WAL for this storage
     pub fn enableDurabilityForStorage(self: *Self, wal_path: []const u8) !void {
-        const storage_stats = self.storage.getStats();
+        const storage_stats = self.tables.getStats();
         const wal_config = wal.DurabilityManager.Config.forStorage(wal_path, storage_stats.total_capacity);
         try self.enableDurability(wal_config);
     }
@@ -308,8 +311,8 @@ pub const WILD = struct {
         std.debug.assert(self.snapshot_manager == null); // Should only be called once
 
         // A snapshot may be taken from a thread other than the one serving
-        // reads, so the table has to be guarded before that can happen.
-        self.storage.enableSync();
+        // reads, so every table has to be guarded before that can happen.
+        self.tables.enableSync();
 
         // Initialize snapshot manager using static allocator
         self.snapshot_manager = try snapshot.SnapshotManager.init(self.allocator, snapshot_config);
@@ -323,7 +326,7 @@ pub const WILD = struct {
             else
                 0;
 
-            try snap_mgr.createSnapshot(&self.storage, current_wal_position);
+            try snap_mgr.createSnapshot(&self.tables, current_wal_position);
         } else {
             return error.SnapshotsNotEnabled;
         }
@@ -334,7 +337,7 @@ pub const WILD = struct {
         if (self.snapshot_manager) |*snap_mgr| {
             var recovery_coordinator = snapshot.RecoveryCoordinator.init(self.allocator, snap_mgr, wal_file_path);
 
-            const final_wal_position = try recovery_coordinator.performRecovery(&self.storage);
+            const final_wal_position = try recovery_coordinator.performRecovery(&self.tables);
 
             // Update WAL offset if durability is enabled
             if (self.durability) |*dur| {
@@ -370,14 +373,14 @@ pub const WILD = struct {
             return error.DurabilityRequired;
         }
 
-        // A bootstrap snapshot walks the table from the replication thread.
-        self.storage.enableSync();
+        // A bootstrap snapshot walks every table from the replication thread.
+        self.tables.enableSync();
 
         // Initialize primary replicator
         self.primary_replicator = try replication.PrimaryReplicator.init(
             self.allocator,
             &self.durability.?,
-            &self.storage,
+            &self.tables,
             listen_port,
             auth_secret,
         );
@@ -397,8 +400,8 @@ pub const WILD = struct {
         std.debug.assert(self.replica_node == null);
 
         // Replica apply runs on the receive thread, not the thread that serves
-        // clients. That is the second thread the table has to tolerate.
-        self.storage.enableSync();
+        // clients. That is the second thread the tables have to tolerate.
+        self.tables.enableSync();
 
         // Initialize replica node
         self.replica_node = try replication.ReplicaNode.init(

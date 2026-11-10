@@ -482,7 +482,7 @@ fn reportProbeLengths(database: *wild.WILD, keys: []const u64) void {
     var max_lines: u32 = 0;
 
     for (keys) |key| {
-        const lines = database.storage.probeLength(key) orelse {
+        const lines = database.tables.probeLength(key) orelse {
             missing += 1;
             continue;
         };

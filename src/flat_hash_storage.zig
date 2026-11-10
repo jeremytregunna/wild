@@ -1,6 +1,7 @@
 const std = @import("std");
 const cache_topology = @import("cache_topology.zig");
 const os_compat = @import("os_compat.zig");
+const partition = @import("partition.zig");
 
 // Cache-line-aligned record that fits exactly in one cache line
 pub const CacheLineRecord = extern struct {
@@ -564,12 +565,24 @@ pub const FlatHashStorage = struct {
     ///
     /// Returns how many entries were applied.
     pub fn applyEntries(self: *Self, entries: []const wal.WALEntry) usize {
+        return self.applyEntriesRouted(entries, 0, 1);
+    }
+
+    /// Apply the entries whose keys route to table `table_index`, in one
+    /// critical section.
+    ///
+    /// One table (`table_count` 1) takes every entry, which is the unpartitioned
+    /// case. A partitioned table takes only its own: storing another table's
+    /// key here would put a record where no lookup looks, so it would be
+    /// present and invisible until the next recovery rebuilt it correctly.
+    pub fn applyEntriesRouted(self: *Self, entries: []const wal.WALEntry, table_index: u16, table_count: u16) usize {
         self.lockSync();
         defer self.unlockSync();
 
         var applied: usize = 0;
         for (entries) |*entry| {
             if (!entry.isValid()) continue;
+            if (table_count > 1 and partition.tableOfKey(entry.getKey(), table_count) != table_index) continue;
             self.applyEntryLocked(entry) catch continue;
             applied += 1;
         }
@@ -583,6 +596,13 @@ pub const FlatHashStorage = struct {
     ///
     /// Returns how many records were applied.
     pub fn applySnapshotBytes(self: *Self, bytes: []const u8) usize {
+        return self.applySnapshotBytesRouted(bytes, 0, 1);
+    }
+
+    /// Apply the records of a bootstrap snapshot whose keys route to table
+    /// `table_index`. Same rule as `applyEntriesRouted`: a record another table
+    /// owns is skipped, not stored and hidden.
+    pub fn applySnapshotBytesRouted(self: *Self, bytes: []const u8, table_index: u16, table_count: u16) usize {
         self.lockSync();
         defer self.unlockSync();
 
@@ -593,6 +613,7 @@ pub const FlatHashStorage = struct {
             offset += @sizeOf(CacheLineRecord);
 
             if (!record.isValid() or record.isDelete()) continue;
+            if (table_count > 1 and partition.tableOfKey(record.getKey(), table_count) != table_index) continue;
             self.writeLocked(record.getKey(), record.getData(), false) catch continue;
             applied += 1;
         }

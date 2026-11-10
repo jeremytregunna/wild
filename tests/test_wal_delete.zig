@@ -38,8 +38,8 @@ fn newStorage(
     allocator: std.mem.Allocator,
     topology: *wildb_lib.CacheTopology,
     capacity: u32,
-) !?flat_hash_storage.FlatHashStorage {
-    const store = flat_hash_storage.FlatHashStorage.init(allocator, topology, capacity) catch
+) !?wildb_lib.TableSet {
+    const store = wildb_lib.TableSet.init(allocator, topology, capacity, null) catch
         return null;
     return store;
 }
@@ -112,9 +112,9 @@ test "replaying a WAL that deletes a key leaves that key gone" {
     try testing.expect(end_position > 0);
 
     // Before the fix, a was replayed as a write of an empty value and came back.
-    try testing.expectEqual(@as(?*const CacheLineRecord, null), store.read(111));
+    try testing.expectEqual(@as(?*const CacheLineRecord, null), try store.read(111));
 
-    const survivor = store.read(222) orelse return error.KeyLostDuringReplay;
+    const survivor = try store.read(222) orelse return error.KeyLostDuringReplay;
     try testing.expectEqualStrings("value-b", survivor.getData());
     try testing.expectEqual(@as(u32, 1), store.getStats().total_count);
 }
@@ -144,7 +144,7 @@ test "replaying writes after the delete in the same log keeps them" {
     var replayer = wildb_lib.snapshot.WALReplayer.init(alloc, wal_path);
     _ = try replayer.replayFromPosition(&store, 0, null);
 
-    const record = store.read(111) orelse return error.KeyLostDuringReplay;
+    const record = try store.read(111) orelse return error.KeyLostDuringReplay;
     try testing.expectEqualStrings("second", record.getData());
 }
 
@@ -170,7 +170,7 @@ test "delete appends a marker entry to the WAL" {
     store.enableDurability(&durability);
 
     try store.write(333, "value-c");
-    try testing.expect(store.delete(333));
+    try testing.expect(try store.delete(333));
 
     // appendAsync walks the rings round-robin, so the two entries landed in
     // two different rings. Collect every ring, as the durability thread does.
@@ -213,7 +213,7 @@ test "applyEntry applies writes, applies deletes, and ignores a delete for a mis
     try testing.expectEqual(@as(u32, 1), store.getStats().total_count);
 
     try store.applyEntry(&deleteEntry(999));
-    try testing.expectEqual(@as(?*const CacheLineRecord, null), store.read(999));
+    try testing.expectEqual(@as(?*const CacheLineRecord, null), try store.read(999));
     try testing.expectEqual(@as(u32, 0), store.getStats().total_count);
 
     // Applying a marker must not leave an occupied slot behind, or the table
@@ -243,7 +243,7 @@ test "restoring a marker is refused and restoring a present key does not inflate
     // slot that no probe can reach is exactly the failure the delete fix removed.
     const marker = CacheLineRecord.initDelete(555);
     try store.restoreRecord(&marker);
-    try testing.expectEqual(@as(?*const CacheLineRecord, null), store.read(555));
+    try testing.expectEqual(@as(?*const CacheLineRecord, null), try store.read(555));
     try testing.expectEqual(@as(u32, 0), store.getStats().total_count);
 
     // Restoring a key the table already holds is an update, not a new record.
@@ -252,7 +252,7 @@ test "restoring a marker is refused and restoring a present key does not inflate
     try store.restoreRecord(&record);
     try testing.expectEqual(@as(u32, 1), store.getStats().total_count);
 
-    const found = store.read(555) orelse return error.KeyLostOnRestore;
+    const found = try store.read(555) orelse return error.KeyLostOnRestore;
     try testing.expectEqualStrings("restored", found.getData());
 }
 
@@ -306,14 +306,14 @@ test "a deleted key does not come back when the log is replayed into a full tabl
     for (0..128) |i| {
         const expected = std.fmt.bufPrint(&buf, "v{d}", .{i}) catch unreachable;
         if (i % 2 == 0) {
-            try testing.expectEqual(@as(?*const CacheLineRecord, null), store.read(i));
+            try testing.expectEqual(@as(?*const CacheLineRecord, null), try store.read(i));
         } else {
             live += 1;
-            const found = store.read(i) orelse return error.KeyStrandedByDelete;
+            const found = try store.read(i) orelse return error.KeyStrandedByDelete;
             try testing.expectEqualStrings(expected, found.getData());
         }
     }
-    const late = store.read(1000) orelse return error.KeyLostDuringReplay;
+    const late = try store.read(1000) orelse return error.KeyLostDuringReplay;
     try testing.expectEqualStrings("late", late.getData());
 
     live += 1;

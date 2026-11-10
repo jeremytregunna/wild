@@ -441,7 +441,7 @@ pub const WildServer = struct {
         _ = self.batches.fetchAdd(1, .monotonic);
         _ = self.batched_reads.fetchAdd(n, .monotonic);
 
-        _ = self.database.storage.readBatchPipelined(
+        _ = self.database.tables.readBatchPipelined(
             self.batch_keys[0..n],
             self.batch_results[0..n],
             wild.WILD.default_microbatch,
