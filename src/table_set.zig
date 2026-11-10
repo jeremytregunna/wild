@@ -265,25 +265,29 @@ pub const TableSet = struct {
         const zones: u16 = @intCast(@max(1, domains.len));
         const table_count: u16 = if (force_tables) |forced| @max(1, forced) else zones;
 
-        // Split the capacity the one-table design would have had. Each piece
-        // is rounded down to a power of two on its own, because the slot
-        // arithmetic is bitwise; the report shows what is usable.
+        // Split the capacity the one-table design would have had. The slot
+        // arithmetic is bitwise, so every piece must be a power of two — and
+        // the pieces must still add up to the total, or a snapshot taken on a
+        // node with one zone count could not be restored on a node with
+        // another: the header stores the total, and restore refuses a
+        // mismatch.
         const total = roundCapacity(target_capacity);
-        const piece = roundCapacity(@max(1, @divFloor(total, @as(u32, table_count))));
+        const pieces = try splitCapacity(allocator, total, table_count);
+        defer allocator.free(pieces);
 
-        const tables = try allocator.alloc(Table, table_count);
+        const tables = try allocator.alloc(Table, pieces.len);
         errdefer allocator.free(tables);
 
         // Allocate every piece before any owner thread runs. The allocator the
         // database runs on is a bump arena that is not thread safe, so nothing
         // may allocate once the owners are live.
-        const slices = try allocator.alloc([]CacheLineRecord, table_count);
+        const slices = try allocator.alloc([]CacheLineRecord, pieces.len);
         defer allocator.free(slices);
 
         var allocated: usize = 0;
         errdefer for (slices[0..allocated]) |slice| allocator.free(slice);
 
-        for (slices) |*slice| {
+        for (slices, pieces) |*slice, piece| {
             // Each piece is its own allocation, so each can be bound to its own
             // node without touching a neighbour's pages.
             slice.* = try allocator.alignedAlloc(CacheLineRecord, @fromBackingInt(@intCast(6)), piece);
@@ -300,7 +304,7 @@ pub const TableSet = struct {
             };
         }
 
-        if (table_count == 1) {
+        if (tables.len == 1) {
             placeInCaller(&tables[0], topology, allocator, slices[0]);
             started = 1;
         } else {
@@ -727,6 +731,39 @@ fn placeInCaller(table: *Table, topology: *const cache_topology.CacheTopology, a
     table.memory_node = if (records.len > 0) os_compat.nodeOfPage(@ptrCast(records.ptr)) else null;
 }
 
+/// Split a capacity across tables so that every piece is a power of two and
+/// the pieces add up to the total exactly.
+///
+/// Splitting evenly does neither: 1024 over three zones is 341.33 apiece, and
+/// rounding each down to 256 loses a quarter of the table and makes the total
+/// 768. A snapshot header records the total, and restore refuses a mismatch,
+/// so that loss is also a snapshot that cannot be restored on a machine with a
+/// different zone count.
+///
+/// Halving from one piece keeps both properties: a split replaces one piece by
+/// two half-sized ones, so every piece stays a power of two and the sum never
+/// changes. Pieces end up within a factor of two of each other, and the caller
+/// stops when it has as many as it asked for, or as many as the total allows
+/// (a total of 1 cannot be split without producing an empty table).
+fn splitCapacity(allocator: std.mem.Allocator, total: u32, requested: u16) ![]u32 {
+    const count: usize = @min(@as(usize, requested), @as(usize, total));
+    const pieces = try allocator.alloc(u32, count);
+
+    pieces[0] = total;
+    var used: usize = 1;
+    while (used < count) : (used += 1) {
+        var largest: usize = 0;
+        for (pieces[0..used], 0..) |piece, index| {
+            if (piece > pieces[largest]) largest = index;
+        }
+        const half = pieces[largest] / 2;
+        pieces[largest] = half;
+        pieces[used] = half;
+    }
+
+    return pieces;
+}
+
 /// The capacity one table would have had: a power of two, rounded down,
 /// because the slot arithmetic is bitwise.
 fn roundCapacity(requested: u64) u32 {
@@ -1030,4 +1067,44 @@ test "restoring a snapshot places each record by its key" {
         const stranger = set.tables[1 - partition.tableOfKey(key, 2)];
         try testing.expect(stranger.storage.read(key) == null);
     }
+}
+
+test "the capacity split keeps every piece a power of two and loses nothing" {
+    var topology = try testTopology(testing.allocator);
+    defer topology.deinit();
+
+    const counts = [_]u16{ 1, 2, 3, 4, 5, 6, 7, 8, 16 };
+    for (counts) |count| {
+        var set = try TableSet.init(testing.allocator, &topology, 1024, count);
+        defer set.deinit();
+
+        var sum: usize = 0;
+        for (set.tables) |table| {
+            try testing.expect(std.math.isPowerOfTwo(table.storage.capacity));
+            try testing.expectEqual(count, set.count());
+            sum += table.storage.capacity;
+        }
+
+        // A quarter of the table used to disappear at three zones, and the
+        // total is what a snapshot header records.
+        try testing.expectEqual(@as(usize, 1024), sum);
+        try testing.expectEqual(@as(usize, 1024), set.totalCapacity());
+
+        // No table is dead weight.
+        for (set.tables) |table| try testing.expect(table.storage.capacity > 0);
+    }
+}
+
+test "a table count larger than the capacity still builds usable tables" {
+    var topology = try testTopology(testing.allocator);
+    defer topology.deinit();
+
+    // 8 slots over 16 tables can only give 8 tables of one slot each; an empty
+    // table has capacity 0, which is not a power of two and would assert.
+    var set = try TableSet.init(testing.allocator, &topology, 8, 16);
+    defer set.deinit();
+
+    try testing.expectEqual(@as(u16, 8), set.count());
+    try testing.expectEqual(@as(usize, 8), set.totalCapacity());
+    for (set.tables) |table| try testing.expectEqual(@as(u32, 1), table.storage.capacity);
 }

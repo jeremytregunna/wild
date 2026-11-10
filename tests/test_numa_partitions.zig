@@ -87,6 +87,62 @@ test "a replayed log puts each entry in the table its key routes to" {
     }
 }
 
+test "a snapshot taken on two tables restores onto three" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var topology = wildb_lib.analyzeCacheTopology(alloc) catch return;
+    defer topology.deinit();
+
+    var source = TableSet.init(alloc, &topology, 1024, 2) catch return;
+    defer source.deinit();
+
+    var keys: [24]u64 = undefined;
+    for (0..keys.len) |index| keys[index] = @intCast(index * 31 + 3);
+    for (keys) |key| {
+        var buffer: [16]u8 = undefined;
+        try source.write(key, try std.fmt.bufPrint(&buffer, "v{d}", .{key}));
+    }
+
+    os_compat.makeDir(scratch_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+
+    var path_buffer: [256]u8 = undefined;
+    const snapshot_path = try std.fmt.bufPrint(&path_buffer, "{s}/two-onto-three.snap", .{scratch_dir});
+    defer os_compat.deleteFile(snapshot_path) catch {};
+
+    var file = try snapshot.SnapshotFile.create(snapshot_path, &source, 0);
+    defer file.deinit();
+
+    // The destination proves a different zone count, so it splits the same
+    // total into different pieces. Every record still has to find its table
+    // from its key, and the totals have to match or restore refuses.
+    var restored = TableSet.init(alloc, &topology, 1024, 3) catch return;
+    defer restored.deinit();
+
+    try testing.expectEqual(@as(u16, 3), restored.count());
+    try testing.expectEqual(source.totalCapacity(), restored.totalCapacity());
+    try file.restoreToStorage(&restored);
+
+    for (keys) |key| {
+        const found = try restored.read(key);
+        try testing.expect(found != null);
+
+        var buffer: [16]u8 = undefined;
+        const expected = try std.fmt.bufPrint(&buffer, "v{d}", .{key});
+        try testing.expectEqualStrings(expected, found.?.getData());
+
+        for (restored.tables, 0..) |table, index| {
+            if (index != partition.tableOfKey(key, 3)) {
+                try testing.expect(table.storage.read(key) == null);
+            }
+        }
+    }
+}
+
 test "a snapshot round-trips two tables" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
