@@ -53,17 +53,23 @@ pub const WALBatch = extern struct {
     entry_count: u16,
     reserved: u16,
     entries: [MAX_BATCH_ENTRIES]WALEntry,
+    padding: [PADDING_SIZE]u8,
 
     // Calculate entries per page: (page_size - header_size) / entry_size
-    // Standard 4KB page: (4096 - 16) / 64 = 63 entries
+    // Standard 4KB page: (4096 - 16) / 64 = 63 entries, leaving 48 bytes.
+    // The padding is not cosmetic: the file is opened with O_DIRECT, which
+    // requires the write length and the file offset to be multiples of the
+    // device block size. A 4048-byte batch gets EINVAL and is never durable.
     pub const HEADER_SIZE = 16; // batch_id + view_number + entry_count + reserved
     pub const MAX_BATCH_ENTRIES = (std.heap.page_size_min - HEADER_SIZE) / @sizeOf(WALEntry);
+    pub const PADDING_SIZE = std.heap.page_size_min - HEADER_SIZE - MAX_BATCH_ENTRIES * @sizeOf(WALEntry);
 
     const Self = @This();
 
     comptime {
-        // Ensure we fit within a page
-        std.debug.assert(@sizeOf(WALBatch) <= std.heap.page_size_min);
+        // The batch is exactly one page, which is also the O_DIRECT granularity
+        // on the platforms WILD supports.
+        std.debug.assert(@sizeOf(WALBatch) == std.heap.page_size_min);
     }
 
     pub fn init(batch_id: u64, view_number: u32) Self {
@@ -73,6 +79,7 @@ pub const WALBatch = extern struct {
             .entry_count = 0,
             .reserved = 0,
             .entries = std.mem.zeroes([MAX_BATCH_ENTRIES]WALEntry),
+            .padding = std.mem.zeroes([PADDING_SIZE]u8),
         };
     }
 
@@ -199,6 +206,10 @@ pub const WALCompletion = struct {
 // Forward declaration for replication callback
 const replication = @import("replication.zig");
 
+/// The ring a thread claimed the first time it logged an entry. See
+/// `DurabilityManager.getThreadLocalWAL` for why one ring per thread matters.
+threadlocal var assigned_ring: ?usize = null;
+
 // WAL file metadata for retention and replication
 pub const WALFileInfo = struct {
     file_id: u64,
@@ -206,7 +217,6 @@ pub const WALFileInfo = struct {
     start_batch_id: u64,
     end_batch_id: u64,
     file_size: u64,
-    created_timestamp: i64,
 
     pub fn deinit(self: *WALFileInfo, allocator: std.mem.Allocator) void {
         allocator.free(self.file_path);
@@ -255,6 +265,17 @@ pub const DurabilityManager = struct {
     pending_ios: std.atomic.Value(u32),
     completed_ios: std.atomic.Value(u64),
 
+    // Highest batch that has actually reached the file, as a count. The batch
+    // id is assigned before the write is submitted, so it can lead this value.
+    // Replica catch-up uses it to decide which slot in the active segment is
+    // already readable.
+    durable_batches: std.atomic.Value(u64),
+
+    // Oldest batch id any connected, caught-up replica still needs. Retention
+    // may not remove a segment whose end is at or beyond this, unless the hard
+    // size cap forces it. `maxInt(u64)` means no replica is pinning WAL.
+    retain_from_batch_id: std.atomic.Value(u64),
+
     // Background thread
     durability_thread: ?std.Thread,
     should_stop: std.atomic.Value(bool),
@@ -262,6 +283,7 @@ pub const DurabilityManager = struct {
     // Statistics - all atomic for lock-free access
     batches_written: std.atomic.Value(u64),
     entries_dropped: std.atomic.Value(u64),
+    drop_warned: std.atomic.Value(bool),
     total_entries_written: std.atomic.Value(u64),
     io_errors: std.atomic.Value(u64),
 
@@ -280,10 +302,13 @@ pub const DurabilityManager = struct {
         batch_buffer_count: u32,
         io_uring_entries: u16, // Size of io_uring submission queue
 
-        // WAL file retention for replication
-        max_wal_files: u32, // Keep last N WAL files for replica catch-up
-        max_file_size_mb: u32, // Roll to new file after N MB
-        retention_hours: u32, // Keep WAL files for N hours
+        // Segment and retention policy. The names and behaviour follow
+        // PostgreSQL: WAL is cut into fixed-size segments, a minimum amount is
+        // kept for restart and short outages, and a maximum amount bounds disk
+        // use even when a replica is far behind.
+        segment_size_mb: u32, // Roll to a new segment after this many MB
+        min_wal_size_mb: u32, // Keep at least this much WAL
+        max_wal_size_mb: u32, // Hard cap; oldest WAL goes first
 
         // Create config with ring buffer sized to match storage capacity exactly
         pub fn forStorage(wal_path: []const u8, storage_capacity: u32) Config {
@@ -296,10 +321,12 @@ pub const DurabilityManager = struct {
                 .batch_buffer_count = @max(8, storage_capacity / 4096), // Scale batch buffers appropriately
                 .io_uring_entries = @intCast(@max(32, @min(storage_capacity / 1024, 512))), // Scale io_uring
 
-                // Default retention policy for replication
-                .max_wal_files = 24, // Keep 24 WAL files (roughly 1 day at 1 file/hour)
-                .max_file_size_mb = 64, // 64MB per file
-                .retention_hours = 24, // 24 hour retention
+                // PostgreSQL-style defaults. One segment is 128MB, so the
+                // 256MB floor is two segments and the 1GB cap is eight. A
+                // replica can be up to 1GB behind before it must bootstrap.
+                .segment_size_mb = 128,
+                .min_wal_size_mb = 256,
+                .max_wal_size_mb = 1024,
             };
         }
     };
@@ -319,6 +346,15 @@ pub const DurabilityManager = struct {
             0o644,
         );
 
+        // Continue at the end of an existing log. Opening the file and writing
+        // from offset zero would overwrite a log this process cannot rebuild.
+        // A file can end mid-batch if the process died during a write, so the
+        // offset is rounded down to the last complete batch.
+        const initial_file = os_compat.File{ .handle = wal_fd };
+        const existing_size = try initial_file.getEndPos();
+        const existing_batches = existing_size / @sizeOf(WALBatch);
+        const initial_offset = existing_batches * @sizeOf(WALBatch);
+
         // Initialize WAL files list
         var wal_files: std.ArrayList(WALFileInfo) = .empty;
 
@@ -327,9 +363,8 @@ pub const DurabilityManager = struct {
             .file_id = 0,
             .file_path = try allocator.dupe(u8, initial_file_path),
             .start_batch_id = 0,
-            .end_batch_id = 0,
-            .file_size = 0,
-            .created_timestamp = os_compat.timestamp(),
+            .end_batch_id = if (existing_batches > 0) existing_batches - 1 else 0,
+            .file_size = initial_offset,
         };
         try wal_files.append(allocator, initial_file_info);
 
@@ -369,7 +404,7 @@ pub const DurabilityManager = struct {
 
         return Self{
             .current_wal_fd = wal_fd,
-            .current_wal_offset = std.atomic.Value(u64).init(0),
+            .current_wal_offset = std.atomic.Value(u64).init(initial_offset),
             .current_file_id = std.atomic.Value(u64).init(0),
             .wal_base_path = wal_base_path,
             .wal_files = wal_files,
@@ -390,10 +425,13 @@ pub const DurabilityManager = struct {
             .awaiting_lock = os_compat.Mutex{},
             .pending_ios = std.atomic.Value(u32).init(0),
             .completed_ios = std.atomic.Value(u64).init(0),
+            .durable_batches = std.atomic.Value(u64).init(existing_batches),
+            .retain_from_batch_id = std.atomic.Value(u64).init(std.math.maxInt(u64)),
             .durability_thread = null,
             .should_stop = std.atomic.Value(bool).init(false),
-            .batches_written = std.atomic.Value(u64).init(0),
+            .batches_written = std.atomic.Value(u64).init(existing_batches),
             .entries_dropped = std.atomic.Value(u64).init(0),
+            .drop_warned = std.atomic.Value(bool).init(false),
             .total_entries_written = std.atomic.Value(u64).init(0),
             .io_errors = std.atomic.Value(u64).init(0),
             .primary_replicator = null,
@@ -403,11 +441,9 @@ pub const DurabilityManager = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        // Stop durability thread if running
-        if (self.durability_thread) |thread| {
-            self.should_stop.store(true, .release);
-            thread.join();
-        }
+        // Flush anything still in the rings and wait for I/O before tearing
+        // down the ring that carries it.
+        self.stop();
 
         // Clean up io_uring
         self.ring.deinit();
@@ -446,6 +482,83 @@ pub const DurabilityManager = struct {
             thread.join();
             self.durability_thread = null;
         }
+        self.flushRings();
+    }
+
+    /// Drain every ring, write it, wait for the completions, and fsync.
+    ///
+    /// Called after the durability thread has stopped, and on a shutdown that
+    /// never started one. A clean stop that only joined the thread would leave
+    /// whatever was appended since the last drain in memory, which is the same
+    /// loss a crash causes, except the operator asked for an orderly exit.
+    fn flushRings(self: *Self) void {
+        var rounds: u32 = 0;
+        while (rounds < 10_000) : (rounds += 1) {
+            const pending = self.pending_ios.load(.acquire);
+            if (pending == 0 and !self.ringsHaveEntries()) break;
+
+            var submitted: u32 = 0;
+            for (self.tls_wals) |*ring| {
+                const completion = self.getAvailableCompletion() orelse break;
+                const batch = completion.batch;
+
+                const entry_count = ring.drainBatch(batch);
+                if (entry_count == 0) {
+                    self.returnCompletion(completion);
+                    continue;
+                }
+
+                batch.batch_id = self.batches_written.fetchAdd(1, .monotonic);
+                batch.view_number = self.current_view_number.load(.acquire);
+
+                // No streaming to replicas here: replication is stopped before
+                // durability on the shutdown path, and a replica that needs
+                // this batch can read it from the WAL after catch-up.
+                self.submitBatchAsync(completion) catch |err| {
+                    std.debug.print("WAL submit error during flush: {}\n", .{err});
+                    _ = self.io_errors.fetchAdd(1, .monotonic);
+                    _ = self.entries_dropped.fetchAdd(entry_count, .monotonic);
+                    self.returnCompletion(completion);
+                    continue;
+                };
+                _ = self.total_entries_written.fetchAdd(entry_count, .monotonic);
+                submitted += 1;
+            }
+
+            if (submitted > 0) {
+                _ = self.ring.submit() catch {};
+            }
+
+            if (self.pending_ios.load(.acquire) > 0) {
+                self.processCompletions() catch {
+                    os_compat.sleep(1000);
+                    continue;
+                };
+            } else if (submitted == 0) {
+                os_compat.sleep(1000);
+            }
+        }
+
+        if (self.ringsHaveEntries()) {
+            std.debug.print(
+                "WAL shutdown: entries remain in the rings and could not be written; they are not durable\n",
+                .{},
+            );
+        }
+
+        // O_DIRECT skips the page cache but not the device cache. An orderly
+        // stop has to ask for the barrier as well.
+        os_compat.fsync(self.current_wal_fd) catch |err| {
+            std.debug.print("WAL fsync failed on shutdown: {}\n", .{err});
+            _ = self.io_errors.fetchAdd(1, .monotonic);
+        };
+    }
+
+    fn ringsHaveEntries(self: *const Self) bool {
+        for (self.tls_wals) |*ring| {
+            if (ring.getUsage().used > 0) return true;
+        }
+        return false;
     }
 
     // Set primary replicator for streaming batches to replicas
@@ -463,25 +576,105 @@ pub const DurabilityManager = struct {
         self.current_view_number.store(view_number, .release);
     }
 
-    // Check if current WAL file should be rotated
-    fn shouldRotateWALFile(self: *Self) bool {
-        const current_size = self.current_wal_offset.load(.acquire);
-        const max_size = @as(u64, self.config.max_file_size_mb) * 1024 * 1024;
-        return current_size >= max_size;
+    /// Tell retention the oldest batch id that a connected replica still needs.
+    /// A segment whose end is below this id is safe to remove.
+    pub fn setRetainFromBatchId(self: *Self, batch_id: u64) void {
+        self.retain_from_batch_id.store(batch_id, .release);
     }
 
-    // Rotate to a new WAL file
-    fn rotateWALFile(self: *Self) !void {
+    /// No replica is pinning WAL; retention falls back to the size floor.
+    pub fn clearRetainFromBatchId(self: *Self) void {
+        self.retain_from_batch_id.store(std.math.maxInt(u64), .release);
+    }
+
+    /// Highest batch whose write has completed. A batch id below this is on
+    /// disk; an id at or above it may still be in flight.
+    pub fn lastDurableBatch(self: *const Self) ?u64 {
+        const count = self.durable_batches.load(.acquire);
+        return if (count == 0) null else count - 1;
+    }
+
+    fn durableEndLocked(self: *const Self) ?u64 {
+        const count = self.durable_batches.load(.acquire);
+        return if (count == 0) null else count - 1;
+    }
+
+    /// End of a segment as far as a reader can trust it. The active segment's
+    /// stored end is settled at the next rotation, so completed batches from
+    /// `durable_batches` fill the gap. An old segment is clamped to the same
+    /// value: a batch with an assigned id can still be in flight.
+    fn effectiveEndLocked(self: *const Self, index: usize) u64 {
+        const file = &self.wal_files.items[index];
+        var end = file.end_batch_id;
+        const durable_end = self.durableEndLocked() orelse return end;
+
+        if (index == self.wal_files.items.len - 1 and durable_end >= file.start_batch_id) {
+            end = @max(end, durable_end);
+        }
+        return @min(end, durable_end);
+    }
+
+    /// Read one batch by id. This is the replica catch-up path, so it takes the
+    /// same lock rotation and retention take: a segment may not disappear
+    /// while it is being opened.
+    pub fn readBatch(self: *Self, batch_id: u64) ?WALBatch {
+        self.wal_files_mutex.lock();
+        defer self.wal_files_mutex.unlock();
+
+        for (self.wal_files.items, 0..) |*file_info, i| {
+            if (batch_id < file_info.start_batch_id) continue;
+            if (batch_id > self.effectiveEndLocked(i)) continue;
+
+            {
+                const file = os_compat.openFile(file_info.file_path, .{}) catch continue;
+                defer file.close();
+
+                const offset = (batch_id - file_info.start_batch_id) * @sizeOf(WALBatch);
+                file.seekTo(offset) catch continue;
+
+                var batch: WALBatch = undefined;
+                const bytes_read = file.readAll(std.mem.asBytes(&batch)) catch continue;
+                if (bytes_read == @sizeOf(WALBatch) and batch.batch_id == batch_id) {
+                    return batch;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    fn recordDurable(self: *Self, batch_id: u64) void {
+        var current = self.durable_batches.load(.acquire);
+        const next = batch_id + 1;
+        while (next > current) {
+            if (self.durable_batches.cmpxchgWeak(current, next, .acq_rel, .acquire)) |actual| {
+                current = actual;
+            } else return;
+        }
+    }
+
+    // Check if current WAL segment should be rotated
+    fn shouldRotateWALFile(self: *Self) bool {
+        const current_size = self.current_wal_offset.load(.acquire);
+        const segment_size = @as(u64, self.config.segment_size_mb) * 1024 * 1024;
+        return current_size >= segment_size;
+    }
+
+    // Rotate to a new WAL file. `next_batch_id` is the id of the first batch
+    // that will be written to the new file.
+    pub fn rotateWALFile(self: *Self, next_batch_id: u64) !void {
         const new_file_id = self.current_file_id.fetchAdd(1, .monotonic) + 1;
 
         // Create new WAL file path
         const new_file_path = try std.fmt.allocPrint(self.allocator, "{s}.{:0>6}", .{ self.wal_base_path, new_file_id });
 
-        // Open new WAL file
+        // Open the new segment. TRUNC matters after a restart: an old file
+        // with this name may still hold a longer WAL from a previous run, and
+        // a write from offset zero would leave its tail in place.
         const new_wal_fd = try std.posix.openat(
             std.posix.AT.FDCWD,
             new_file_path,
-            .{ .ACCMODE = .RDWR, .CREAT = true, .DIRECT = true },
+            .{ .ACCMODE = .RDWR, .CREAT = true, .DIRECT = true, .TRUNC = true },
             0o644,
         );
 
@@ -491,7 +684,10 @@ pub const DurabilityManager = struct {
 
         if (self.wal_files.items.len > 0) {
             const current_file = &self.wal_files.items[self.wal_files.items.len - 1];
-            current_file.end_batch_id = self.batches_written.load(.acquire);
+            // The previous segment holds every batch before the first batch
+            // that goes into the new one. A batch is streamed before it is
+            // submitted, so `next_batch_id` is the first id the new file owns.
+            current_file.end_batch_id = if (next_batch_id > 0) next_batch_id - 1 else 0;
             current_file.file_size = self.current_wal_offset.load(.acquire);
         }
 
@@ -504,10 +700,9 @@ pub const DurabilityManager = struct {
         const new_file_info = WALFileInfo{
             .file_id = new_file_id,
             .file_path = new_file_path,
-            .start_batch_id = self.batches_written.load(.acquire),
-            .end_batch_id = 0, // Will be set when file is rotated
+            .start_batch_id = next_batch_id,
+            .end_batch_id = if (next_batch_id > 0) next_batch_id - 1 else 0,
             .file_size = 0,
-            .created_timestamp = os_compat.timestamp(),
         };
         try self.wal_files.append(self.allocator, new_file_info);
 
@@ -515,39 +710,56 @@ pub const DurabilityManager = struct {
         self.cleanupOldWALFiles();
     }
 
-    // Remove old WAL files based on retention policy
+    // Remove old WAL segments. The caller holds `wal_files_mutex`.
+    //
+    // The policy follows PostgreSQL rather than a file count or file age:
+    //
+    // - Keep at least `min_wal_size_mb` for restart and short outages.
+    // - Keep a segment while a connected replica still needs any batch in it.
+    //   `retain_from_batch_id` is the oldest batch id not yet consumed, so a
+    //   segment is consumed when its end is below that id.
+    // - If the total exceeds `max_wal_size_mb`, remove the oldest segment even
+    //   if a replica still needs it. That is the `max_slot_wal_keep_size`
+    //   behaviour: disk stays bounded and the lagging replica must bootstrap.
+    // - Never remove the active segment. Its descriptor is the only handle on
+    //   the inode, and unlinking it would make the open file unreachable.
     fn cleanupOldWALFiles(self: *Self) void {
-        const current_time = os_compat.timestamp();
-        const retention_seconds = @as(i64, self.config.retention_hours) * 3600;
+        const mb = 1024 * 1024;
+        const segment_bytes = @as(u64, @max(1, self.config.segment_size_mb)) * mb;
+        const max_bytes = @max(segment_bytes, @as(u64, self.config.max_wal_size_mb) * mb);
+        const min_bytes = @min(@as(u64, self.config.min_wal_size_mb) * mb, max_bytes);
+        const retain_from = self.retain_from_batch_id.load(.acquire);
 
-        var files_to_remove: std.ArrayList(usize) = .empty;
-        defer files_to_remove.deinit(self.allocator);
-
-        // Find files to remove (keep files_mutex locked for consistency)
+        var total: u64 = 0;
         for (self.wal_files.items, 0..) |*file_info, i| {
-            const file_age = current_time - file_info.created_timestamp;
-            const should_remove_by_age = file_age > retention_seconds;
-            const should_remove_by_count = i < self.wal_files.items.len - self.config.max_wal_files;
-
-            if (should_remove_by_age or should_remove_by_count) {
-                files_to_remove.append(self.allocator, i) catch continue;
-            }
+            total += if (i == self.wal_files.items.len - 1)
+                self.current_wal_offset.load(.acquire)
+            else
+                file_info.file_size;
         }
 
-        // Remove files in reverse order to maintain indices
-        var i = files_to_remove.items.len;
-        while (i > 0) {
-            i -= 1;
-            const file_index = files_to_remove.items[i];
-            var file_info = self.wal_files.orderedRemove(file_index);
+        while (self.wal_files.items.len > 1) {
+            const oldest = self.wal_files.items[0];
+            // Use >=: at the moment a fresh segment is opened the total can sit
+            // exactly at the cap. Wait for the next rotation and the active
+            // segment will have grown one full segment past it.
+            const over_max = total >= max_bytes;
+            const over_min = total > min_bytes;
+            const consumed = oldest.end_batch_id < retain_from;
 
-            // Delete the actual file
+            if (!over_max and !(over_min and consumed)) break;
+
+            var file_info = self.wal_files.orderedRemove(0);
+            total -|= file_info.file_size;
             os_compat.unlink(file_info.file_path) catch {};
             file_info.deinit(self.allocator);
         }
     }
 
-    // Get list of available WAL files for replica catch-up
+    // Get list of available WAL files for replica catch-up.
+    //
+    // The active segment's stored end is settled only when the next segment is
+    // opened, so report the completed batches for it instead of the stale end.
     pub fn getAvailableWALFiles(self: *Self, allocator: std.mem.Allocator) ![]WALFileInfo {
         self.wal_files_mutex.lock();
         defer self.wal_files_mutex.unlock();
@@ -558,41 +770,61 @@ pub const DurabilityManager = struct {
                 .file_id = file_info.file_id,
                 .file_path = try allocator.dupe(u8, file_info.file_path),
                 .start_batch_id = file_info.start_batch_id,
-                .end_batch_id = file_info.end_batch_id,
-                .file_size = file_info.file_size,
-                .created_timestamp = file_info.created_timestamp,
+                .end_batch_id = self.effectiveEndLocked(i),
+                .file_size = if (i == self.wal_files.items.len - 1)
+                    self.current_wal_offset.load(.acquire)
+                else
+                    file_info.file_size,
             };
         }
         return files;
     }
 
-    // Get a thread-local WAL ring - round-robin assignment
-    pub fn getThreadLocalWAL(self: *Self) *ThreadLocalWAL {
-        const index = self.current_tls_index.fetchAdd(1, .monotonic) % self.tls_wals.len;
-        return &self.tls_wals[index];
+    // Get a thread-local WAL ring. Each thread claims one slot on first use and
+    // keeps it for the life of the process.
+    //
+    // The slot matters for correctness, not just contention: replay applies the
+    // log in file order, and a ring is drained as a unit. Handing successive
+    // appends from one thread to different rings interleaves that thread's
+    // history in an order the log never saw, which replay then reorders. One
+    // ring per thread keeps each thread's appends in the order it made them;
+    // order between two threads is not defined and never was.
+    //
+    // Returns null when every slot is already claimed. That caller's entry is
+    // dropped and counted, rather than appended to a ring another thread is
+    // writing.
+    pub fn getThreadLocalWAL(self: *Self) ?*ThreadLocalWAL {
+        if (assigned_ring == null or assigned_ring.? >= self.tls_wals.len) {
+            const claimed = self.current_tls_index.fetchAdd(1, .monotonic);
+            if (claimed >= self.tls_wals.len) return null;
+            assigned_ring = claimed;
+        }
+        return &self.tls_wals[assigned_ring.?];
     }
 
     // Append WAL entry - never blocks, returns false if ring buffer full
     pub fn appendAsync(self: *Self, record: *const flat_hash_storage.CacheLineRecord) bool {
         const wal_entry = WALEntry.fromCacheLineRecord(record);
 
-        // Try multiple thread-local rings to improve success rate
-        var attempts: u8 = 0;
-        const max_attempts = @min(4, self.tls_wals.len);
+        const tls_wal = self.getThreadLocalWAL() orelse {
+            self.recordDrop();
+            return false;
+        };
 
-        while (attempts < max_attempts) {
-            const tls_wal = self.getThreadLocalWAL();
+        if (tls_wal.appendNonBlocking(wal_entry)) return true;
 
-            if (tls_wal.appendNonBlocking(wal_entry)) {
-                return true; // Success
-            }
-
-            attempts += 1;
-        }
-
-        // All attempts failed - record dropped entry
-        _ = self.entries_dropped.fetchAdd(1, .monotonic);
+        self.recordDrop();
         return false;
+    }
+
+    fn recordDrop(self: *Self) void {
+        const total = self.entries_dropped.fetchAdd(1, .monotonic) + 1;
+        if (!self.drop_warned.swap(true, .monotonic)) {
+            std.debug.print(
+                "WAL ring full: durability is behind and entries are being dropped (total dropped so far: {}). The write still succeeds in memory. See the `entries_dropped` figure in daemon stats.\n",
+                .{total},
+            );
+        }
     }
 
     fn getAvailableCompletion(self: *Self) ?*WALCompletion {
@@ -679,6 +911,7 @@ pub const DurabilityManager = struct {
                     self.submitBatchAsync(completion) catch |err| {
                         std.debug.print("WAL submit error: {}\n", .{err});
                         _ = self.io_errors.fetchAdd(1, .monotonic);
+                        _ = self.entries_dropped.fetchAdd(entry_count, .monotonic);
                         self.returnCompletion(completion);
                         continue;
                     };
@@ -736,130 +969,9 @@ pub const DurabilityManager = struct {
             }
         }
 
-        // Final cleanup: wait for all pending I/Os to complete with robust retry
-        var cleanup_attempts: u32 = 0;
-        while (self.pending_ios.load(.acquire) > 0 and cleanup_attempts < 100) {
-            // Submit any remaining operations
-            _ = self.ring.submit() catch {};
-
-            // Process completions with progressively longer waits
-            self.processCompletions() catch |err| {
-                std.debug.print("Cleanup completion error: {}\n", .{err});
-            };
-
-            cleanup_attempts += 1;
-            if (cleanup_attempts > 20) {
-                // After 20 attempts, start backing off more aggressively
-                const backoff_ms = @min(cleanup_attempts - 20, 10);
-                os_compat.sleep(@as(u64, backoff_ms) * 1000_000); // Convert to nanoseconds
-            } else {
-                os_compat.sleep(1000); // 1μs between early attempts
-            }
-        }
-
-        // Comprehensive shutdown: ensure ALL pending I/Os complete
-        const initial_pending = self.pending_ios.load(.acquire);
-        if (initial_pending > 0) {
-            std.debug.print("Shutdown: waiting for {} pending I/Os to complete...\n", .{initial_pending});
-
-            var shutdown_attempts: u16 = 0;
-            while (self.pending_ios.load(.acquire) > 0 and shutdown_attempts < 500) {
-                // Multiple submission strategies
-                const submitted = self.ring.submit() catch 0;
-
-                // Try different completion approaches
-                if (shutdown_attempts < 100) {
-                    // Strategy 1: Normal completion processing
-                    self.processCompletions() catch |err| {
-                        if (shutdown_attempts % 50 == 0) {
-                            std.debug.print("Completion error (attempt {}): {}\n", .{ shutdown_attempts, err });
-                        }
-                    };
-                } else if (shutdown_attempts < 300) {
-                    // Strategy 2: More aggressive - bypass our wrapper and use raw io_uring
-                    const cq_ready = self.ring.cq_ready();
-                    if (cq_ready > 0) {
-                        var processed: u32 = 0;
-                        while (self.ring.cq_ready() > 0 and processed < cq_ready) {
-                            const cqe = self.ring.copy_cqe() catch break;
-
-                            // Handle completion properly - check for errors
-                            if (cqe.res < 0) {
-                                _ = self.io_errors.fetchAdd(1, .monotonic);
-                            } else if (cqe.res != @sizeOf(WALBatch)) {
-                                _ = self.io_errors.fetchAdd(1, .monotonic);
-                            }
-
-                            _ = self.pending_ios.fetchSub(1, .monotonic);
-                            _ = self.completed_ios.fetchAdd(1, .monotonic);
-                            processed += 1;
-                        }
-                        if (processed > 0 and shutdown_attempts % 50 == 0) {
-                            std.debug.print("Raw processing: {} completions handled\n", .{processed});
-                        }
-                    }
-                } else {
-                    // Strategy 3: Force fsync to ensure data is on disk
-                    if (shutdown_attempts == 300) {
-                        std.debug.print("Forcing fsync to ensure data persistence...\n", .{});
-                        os_compat.fsync(self.current_wal_fd) catch {};
-                    }
-
-                    // Continue trying completions
-                    const cq_ready = self.ring.cq_ready();
-                    if (cq_ready > 0) {
-                        var processed: u32 = 0;
-                        while (self.ring.cq_ready() > 0 and processed < 10) {
-                            const cqe = self.ring.copy_cqe() catch break;
-
-                            // Handle completion properly - check for errors
-                            if (cqe.res < 0) {
-                                _ = self.io_errors.fetchAdd(1, .monotonic);
-                            } else if (cqe.res != @sizeOf(WALBatch)) {
-                                _ = self.io_errors.fetchAdd(1, .monotonic);
-                            }
-
-                            _ = self.pending_ios.fetchSub(1, .monotonic);
-                            _ = self.completed_ios.fetchAdd(1, .monotonic);
-                            processed += 1;
-                        }
-                    }
-                }
-
-                shutdown_attempts += 1;
-
-                // Progress reporting
-                if (shutdown_attempts % 50 == 0) {
-                    const remaining = self.pending_ios.load(.acquire);
-                    std.debug.print("Shutdown progress: {} I/Os remaining (attempt {}, {} submitted)\n", .{ remaining, shutdown_attempts, submitted });
-                }
-
-                // Smart backoff strategy
-                if (shutdown_attempts < 50) {
-                    // No delay for first attempts
-                } else if (shutdown_attempts < 200) {
-                    os_compat.sleep(1000); // 1μs
-                } else if (shutdown_attempts < 400) {
-                    os_compat.sleep(10_000); // 10μs
-                } else {
-                    os_compat.sleep(100_000); // 100μs
-                }
-            }
-
-            const final_pending = self.pending_ios.load(.acquire);
-            if (final_pending == 0) {
-                std.debug.print("✓ Shutdown complete: all {} I/Os flushed successfully after {} attempts\n", .{ initial_pending, shutdown_attempts });
-            } else {
-                std.debug.print("❌ Shutdown timeout after {} attempts: {} of {} I/Os could not be completed\n", .{ shutdown_attempts, final_pending, initial_pending });
-                std.debug.print("   Data has been written to WAL file ({} bytes) but io_uring completions are stuck\n", .{self.current_wal_offset.load(.acquire)});
-
-                // Final desperate attempt: force sync
-                os_compat.fsync(self.current_wal_fd) catch {};
-                std.debug.print("   Forced fsync completed - data should be durable on disk\n", .{});
-            }
-        } else {
-            std.debug.print("✓ Clean shutdown: no pending I/Os\n", .{});
-        }
+        // The rings and pending I/Os are drained by `stop`, on the thread that
+        // called it. Doing it there means a process that never started this
+        // thread still flushes, and it keeps shutdown in one place.
     }
 
     // Submit batch to io_uring for async write (non-blocking)
@@ -884,7 +996,7 @@ pub const DurabilityManager = struct {
 
         // Check if we need to rotate WAL file before writing
         if (self.shouldRotateWALFile()) {
-            self.rotateWALFile() catch |err| {
+            self.rotateWALFile(batch.batch_id) catch |err| {
                 std.debug.print("WAL rotation failed: {}\n", .{err});
                 // Continue with current file if rotation fails
             };
@@ -963,9 +1075,10 @@ pub const DurabilityManager = struct {
 
         // Process completed queue - return completions to pool
         while (self.dequeueCompletion(&self.completed, &self.completed_lock)) |completion| {
-            // Log successful writes if needed
             if (completion.result == @sizeOf(WALBatch)) {
-                // Success - batch was written
+                // The batch is now readable from the active segment. Replica
+                // catch-up uses this watermark, not the assigned batch id.
+                self.recordDurable(completion.batch.batch_id);
             }
 
             // Return completion to available pool

@@ -311,6 +311,10 @@ pub const WILD = struct {
     pub fn enableSnapshots(self: *Self, snapshot_config: snapshot.SnapshotManager.Config) !void {
         std.debug.assert(self.snapshot_manager == null); // Should only be called once
 
+        // A snapshot may be taken from a thread other than the one serving
+        // reads, so the table has to be guarded before that can happen.
+        self.storage.enableSync();
+
         // Initialize snapshot manager using static allocator
         self.snapshot_manager = try snapshot.SnapshotManager.init(self.allocator, snapshot_config);
     }
@@ -370,6 +374,9 @@ pub const WILD = struct {
             return error.DurabilityRequired;
         }
 
+        // A bootstrap snapshot walks the table from the replication thread.
+        self.storage.enableSync();
+
         // Initialize primary replicator
         self.primary_replicator = try replication.PrimaryReplicator.init(
             self.allocator,
@@ -392,6 +399,10 @@ pub const WILD = struct {
     pub fn enableReplicationAsReplica(self: *Self, primary_address: []const u8, primary_port: u16, auth_secret: []const u8) !void {
         std.debug.assert(self.primary_replicator == null);
         std.debug.assert(self.replica_node == null);
+
+        // Replica apply runs on the receive thread, not the thread that serves
+        // clients. That is the second thread the table has to tolerate.
+        self.storage.enableSync();
 
         // Initialize replica node
         self.replica_node = try replication.ReplicaNode.init(

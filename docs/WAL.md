@@ -60,7 +60,8 @@ checking bit 6 brings back the key the delete removed.
 
 ### 2. Batched WAL Format
 
-Operations are batched into 2KB blocks for efficient disk I/O and network replication:
+Operations are batched into one page (4096 bytes) so a write is one O_DIRECT
+operation at a page-aligned offset:
 
 ```zig
 const WALBatch = extern struct {
@@ -68,15 +69,25 @@ const WALBatch = extern struct {
     view_number: u32,            // For viewstamped replication
     entry_count: u16,            // Number of cache lines in batch
     reserved: u16,               // Alignment padding
-    entries: [MAX_BATCH_ENTRIES]WALEntry, // Up to 31 cache line entries
-    
-    const MAX_BATCH_ENTRIES = 31; // 16 + (64 * 31) = 2KB exactly
+    entries: [63]WALEntry,       // 16 + (64 * 63) = 4048 bytes
+    padding: [48]u8,             // Makes the batch exactly one 4096-byte page
+
+    const MAX_BATCH_ENTRIES = 63;
 };
 ```
 
+The padding is required, not cosmetic. The WAL file is opened with O_DIRECT,
+which rejects a write whose length or file offset is not a multiple of the
+device block size. A 4048-byte batch gets `EINVAL` on every write, so nothing
+is durable. `@sizeOf(WALBatch) == std.heap.page_size_min` is asserted at
+compile time.
+
 ### 3. Thread-Local Ring Buffer
 
-Each thread maintains its own lock-free ring buffer to avoid contention:
+Each thread claims one ring on first use and keeps it for the life of the
+process. One ring per thread also preserves order: replay applies the file in
+the order the durability thread drained it, so spreading one thread's writes
+across several rings can apply an older write after a newer one.
 
 ```zig
 const ThreadLocalWAL = struct {
@@ -246,6 +257,48 @@ pub const DurabilityManager = struct {
     }
 };
 ```
+
+## Durability guarantees
+
+- A write updates the table first and appends to a ring without blocking. The
+  write succeeds even if the ring is full. The entry is then not in the log,
+  and `entries_dropped` counts it. The daemon prints that number in its stats.
+- The first drop prints one warning to stderr. Later drops only increment the
+  counter, so a full ring does not flood the log.
+- `DurabilityManager.stop` drains every ring, writes the remaining batches,
+  waits for their completions, and fsyncs before it returns. A clean shutdown
+  therefore does not leave the most recent writes in memory, even if the
+  durability thread was never started.
+- Applying an entry from the log (replay, snapshot, or replica apply) does not
+  append it to the log again. Otherwise replay would grow the file it reads
+  and a replica would log what the primary already logged.
+- Opening an existing log continues after its last complete batch. It does not
+  write over batch 0.
+
+## Segment retention
+
+Retention follows PostgreSQL's model instead of a file count or a file age:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `segment_size_mb` | 128 | Roll to a new segment at this size |
+| `min_wal_size_mb` | 256 | Keep at least this much WAL |
+| `max_wal_size_mb` | 1024 | Hard cap on total WAL |
+
+A segment is kept while a connected, caught-up replica still needs a batch in
+it. The oldest needed batch is the slowest replica's `last_batch_id + 1`; a
+segment whose `end_batch_id` is below it is safe to remove. Replicas that are
+bootstrapping are excluded because their snapshot replaces the WAL history.
+
+When the total exceeds `max_wal_size_mb`, the oldest segment is removed even if
+a replica still needs it. This is the `max_slot_wal_keep_size` trade: disk stays
+bounded, and the lagging replica falls back to a snapshot. Nothing is removed
+by age, and the active segment is never removed.
+
+The active segment is readable by catch-up. Its stored end is settled only when
+the next segment opens, so `readBatch` uses `durable_batches` (batches whose
+writes have completed) to decide which slot is safe to read. Without that
+watermark, every catch-up that reached the current segment would bootstrap.
 
 ## Integration with WILD
 

@@ -272,6 +272,7 @@ pub const WildDaemon = struct {
 
         return DaemonStats{
             .database_stats = db_stats,
+            .durability_stats = db.getDurabilityStatsNoAlloc(),
             .replication_stats = replication_stats,
             .replication_mode = self.config.replication_mode,
             .wal_enabled = self.config.enable_wal,
@@ -285,6 +286,7 @@ pub const WildDaemon = struct {
 
     pub const DaemonStats = struct {
         database_stats: wild.WILD.Stats,
+        durability_stats: ?wild.WILD.DurabilityStatsSimple,
         replication_stats: ?ReplicationStatsUnion,
         replication_mode: DaemonConfig.ReplicationMode,
         wal_enabled: bool,
@@ -297,6 +299,13 @@ pub const WildDaemon = struct {
 
             std.debug.print("Configuration:\n", .{});
             std.debug.print("  WAL: {s}\n", .{if (self.wal_enabled) "enabled" else "disabled"});
+            if (self.durability_stats) |durability| {
+                std.debug.print("  WAL Batches Written: {}\n", .{durability.batches_written});
+                std.debug.print("  WAL Entries Written: {}\n", .{durability.total_entries_written});
+                std.debug.print("  WAL Entries Dropped: {} (writes that are in memory only)\n", .{durability.entries_dropped});
+                std.debug.print("  WAL I/O Errors: {}\n", .{durability.io_errors});
+                std.debug.print("  WAL Pending I/O: {}\n", .{durability.pending_ios});
+            }
             std.debug.print("  Replication: {s}\n", .{@tagName(self.replication_mode)});
 
             if (self.replication_stats) |stats| {

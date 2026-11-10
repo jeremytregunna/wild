@@ -1,5 +1,6 @@
 const std = @import("std");
 const cache_topology = @import("cache_topology.zig");
+const os_compat = @import("os_compat.zig");
 
 // Cache-line-aligned record that fits exactly in one cache line
 pub const CacheLineRecord = extern struct {
@@ -124,6 +125,14 @@ pub const FlatHashStorage = struct {
     topology: *const cache_topology.CacheTopology,
     allocator: std.mem.Allocator,
 
+    // Mutual exclusion for the table. Off by default: the storage is written
+    // to be driven by one thread, and that thread pays nothing for a guard it
+    // does not need. Anything that touches the table from a second thread —
+    // replica apply, a snapshot walk, a concurrent embedded caller — must call
+    // `enableSync` before it starts.
+    sync_enabled: bool,
+    sync_mutex: os_compat.Mutex,
+
     // Optional WAL for durability - null means no durability
     durability_manager: ?*wal.DurabilityManager,
 
@@ -163,10 +172,38 @@ pub const FlatHashStorage = struct {
             .count = 0,
             .topology = topology,
             .allocator = allocator,
+            .sync_enabled = false,
+            .sync_mutex = os_compat.Mutex{},
             .durability_manager = null, // Initially no WAL
             .numa_domains = numa_domains,
             .records_per_domain = records_per_domain,
         };
+    }
+
+    /// Turn on mutual exclusion for the table.
+    ///
+    /// The hot path is written for one thread and relies on that: `count` is a
+    /// plain integer, and a delete shifts records that a concurrent probe may
+    /// be walking. Replication and snapshots put a second thread on the table,
+    /// so they call this before that thread starts. The guard costs one
+    /// predictable branch per operation when it is off, and a mutex when it is
+    /// on; there is no third state.
+    pub fn enableSync(self: *Self) void {
+        self.sync_enabled = true;
+    }
+
+    /// Turn the guard off again. Only safe once no second thread can reach the
+    /// table.
+    pub fn disableSync(self: *Self) void {
+        self.sync_enabled = false;
+    }
+
+    inline fn lockSync(self: *const Self) void {
+        if (self.sync_enabled) @constCast(&self.sync_mutex).lock();
+    }
+
+    inline fn unlockSync(self: *const Self) void {
+        if (self.sync_enabled) @constCast(&self.sync_mutex).unlock();
     }
 
     pub fn deinit(self: *Self) void {
@@ -233,6 +270,12 @@ pub const FlatHashStorage = struct {
     }
 
     pub inline fn read(self: *const Self, key: u64) ?*const CacheLineRecord {
+        self.lockSync();
+        defer self.unlockSync();
+        return self.readLocked(key);
+    }
+
+    inline fn readLocked(self: *const Self, key: u64) ?*const CacheLineRecord {
         const pos = self.findRecord(key) orelse return null;
         return &self.records[pos];
     }
@@ -270,6 +313,9 @@ pub const FlatHashStorage = struct {
     /// full — so fill fraction, not hashing, decides how long a chain gets.
     /// Prefetch hides that latency; only a load-factor policy removes it.
     pub fn probeLength(self: *const Self, key: u64) ?u32 {
+        self.lockSync();
+        defer self.unlockSync();
+
         if (self.count == 0) return null;
 
         const mask = self.capacity - 1;
@@ -322,6 +368,8 @@ pub const FlatHashStorage = struct {
             if (micro == 0 or micro > 1024) @compileError("micro must be between 1 and 1024");
         }
         std.debug.assert(results.len >= keys.len);
+        self.lockSync();
+        defer self.unlockSync();
         if (keys.len == 0) return 0;
 
         if (self.count == 0) {
@@ -374,6 +422,14 @@ pub const FlatHashStorage = struct {
     }
 
     pub inline fn write(self: *Self, key: u64, data: []const u8) !void {
+        self.lockSync();
+        defer self.unlockSync();
+        return self.writeLocked(key, data, true);
+    }
+
+    /// Store a value. `log` is false when the entry came from the log itself:
+    /// replay and replica apply must not write the entry back.
+    fn writeLocked(self: *Self, key: u64, data: []const u8, log: bool) !void {
         const pos = self.findEmptySlot(key) orelse return error.TableFull;
 
         const old_record = &self.records[pos];
@@ -384,12 +440,14 @@ pub const FlatHashStorage = struct {
 
         // PERFORMANCE DESIGN CHOICE: Always-async durability never blocks write path
         // This prioritizes consistent 42ns write latency over guaranteed durability
-        if (self.durability_manager) |dur_mgr| {
-            _ = dur_mgr.appendAsync(&self.records[pos]);
-            // INTENTIONAL: Ignore return value to maintain lock-free performance
-            // Trade-off: WAL ring full = dropped entry, but write still succeeds
-            // Rationale: Better to lose some durability than block all writes
-            // Alternative: Use blocking WAL for critical data, async for cache-like workloads
+        if (log) {
+            if (self.durability_manager) |dur_mgr| {
+                _ = dur_mgr.appendAsync(&self.records[pos]);
+                // INTENTIONAL: Ignore return value to maintain lock-free performance
+                // Trade-off: WAL ring full = dropped entry, but write still succeeds
+                // Rationale: Better to lose some durability than block all writes
+                // Alternative: Use blocking WAL for critical data, async for cache-like workloads
+            }
         }
 
         // Update count only for new insertions
@@ -419,6 +477,13 @@ pub const FlatHashStorage = struct {
     ///
     /// Returns false when the key is not present.
     pub fn delete(self: *Self, key: u64) bool {
+        self.lockSync();
+        defer self.unlockSync();
+        return self.deleteLocked(key, true);
+    }
+
+    /// Remove a key. `log` is false when the removal came from the log itself.
+    fn deleteLocked(self: *Self, key: u64, log: bool) bool {
         const pos = self.findRecord(key) orelse return false;
         self.closeRun(pos);
         self.count -= 1;
@@ -427,9 +492,11 @@ pub const FlatHashStorage = struct {
         // re-applies the write that put the key there, and the key comes back.
         // Same async policy as `write`: a full ring drops the entry and the
         // delete still stands in memory.
-        if (self.durability_manager) |dur_mgr| {
-            const marker = CacheLineRecord.initDelete(key);
-            _ = dur_mgr.appendAsync(&marker);
+        if (log) {
+            if (self.durability_manager) |dur_mgr| {
+                const marker = CacheLineRecord.initDelete(key);
+                _ = dur_mgr.appendAsync(&marker);
+            }
         }
 
         return true;
@@ -446,11 +513,62 @@ pub const FlatHashStorage = struct {
     /// snapshot already settled, and replay sees a delete for a key that was
     /// never in the table.
     pub fn applyEntry(self: *Self, entry: *const wal.WALEntry) !void {
+        self.lockSync();
+        defer self.unlockSync();
+        return self.applyEntryLocked(entry);
+    }
+
+    fn applyEntryLocked(self: *Self, entry: *const wal.WALEntry) !void {
         if (entry.isDelete()) {
-            _ = self.delete(entry.getKey());
+            _ = self.deleteLocked(entry.getKey(), false);
             return;
         }
-        try self.write(entry.getKey(), entry.getData());
+        try self.writeLocked(entry.getKey(), entry.getData(), false);
+    }
+
+    /// Apply log entries from outside the owning thread, under one lock.
+    ///
+    /// A replica drains a batch on its receive thread, so the whole batch is
+    /// one critical section: an entry in the middle of a batch must not become
+    /// visible to a client reader while the rest of the batch is still being
+    /// applied. Invalid entries are the gaps in a partially written batch and
+    /// are skipped, as replay skips them.
+    ///
+    /// Returns how many entries were applied.
+    pub fn applyEntries(self: *Self, entries: []const wal.WALEntry) usize {
+        self.lockSync();
+        defer self.unlockSync();
+
+        var applied: usize = 0;
+        for (entries) |*entry| {
+            if (!entry.isValid()) continue;
+            self.applyEntryLocked(entry) catch continue;
+            applied += 1;
+        }
+        return applied;
+    }
+
+    /// Apply a bootstrap snapshot from outside the owning thread, under one
+    /// lock. The payload is a packed sequence of 64-byte records, the same
+    /// format `createDatabaseSnapshot` sends. Invalid records and delete
+    /// markers are not snapshot contents, so they are skipped.
+    ///
+    /// Returns how many records were applied.
+    pub fn applySnapshotBytes(self: *Self, bytes: []const u8) usize {
+        self.lockSync();
+        defer self.unlockSync();
+
+        var applied: usize = 0;
+        var offset: usize = 0;
+        while (offset + @sizeOf(CacheLineRecord) <= bytes.len) {
+            const record = std.mem.bytesToValue(CacheLineRecord, bytes[offset .. offset + @sizeOf(CacheLineRecord)]);
+            offset += @sizeOf(CacheLineRecord);
+
+            if (!record.isValid() or record.isDelete()) continue;
+            self.writeLocked(record.getKey(), record.getData(), false) catch continue;
+            applied += 1;
+        }
+        return applied;
     }
 
     /// Shift the records after `hole` back by one slot, then clear the last one.
@@ -497,6 +615,9 @@ pub const FlatHashStorage = struct {
     }
 
     pub fn clear(self: *Self) void {
+        self.lockSync();
+        defer self.unlockSync();
+
         // Zero out all records with memset - much faster than looping
         @memset(std.mem.sliceAsBytes(self.records), 0);
         self.count = 0;
@@ -516,6 +637,9 @@ pub const FlatHashStorage = struct {
     pub fn copyAllRecords(self: *const Self, dest_records: []CacheLineRecord) void {
         std.debug.assert(dest_records.len >= self.records.len);
 
+        self.lockSync();
+        defer self.unlockSync();
+
         // Atomic copy of all records using memcpy - fastest approach
         // This gives us a point-in-time snapshot of the entire storage
         @memcpy(dest_records[0..self.records.len], self.records);
@@ -529,6 +653,9 @@ pub const FlatHashStorage = struct {
         // snapshot is corrupt. Storing it would occupy a slot that no probe can
         // reach, because isValid reports true for a marker.
         if (record.isDelete()) return;
+
+        self.lockSync();
+        defer self.unlockSync();
 
         // Find the correct position for this record
         const key = record.getKey();
@@ -544,13 +671,19 @@ pub const FlatHashStorage = struct {
         if (!is_update) self.count += 1;
     }
 
-    // Get record at specific slot index (for snapshot creation)
+    // Get record at specific slot index (for snapshot creation). This is a raw
+    // accessor: it takes no lock, because a snapshot walks every slot and a
+    // lock per slot would cost more than the copy. The caller either is the
+    // owning thread or holds the storage guard across the whole walk.
     pub fn getRecordAtSlot(self: *const Self, slot_index: u32) ?*const CacheLineRecord {
         if (slot_index >= self.capacity) return null;
         return &self.records[slot_index];
     }
 
     pub fn getStats(self: *const Self) StorageStats {
+        self.lockSync();
+        defer self.unlockSync();
+
         return StorageStats{
             .total_count = self.count,
             .total_capacity = self.capacity,

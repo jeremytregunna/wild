@@ -60,7 +60,7 @@ WILD leverages modern CPU architecture for extreme performance:
 - **Flat Hash Storage**: Linear probing with bitwise operations
 - **NUMA Awareness**: Automatic CPU topology detection and optimization
 - **Zero Runtime Allocation**: Static allocator eliminates allocation overhead
-- **Lock-Free Operations**: Atomic primitives for concurrent access
+- **One Owning Thread**: The table is driven by a single thread. Replication and snapshot walks take a storage guard first, so a second thread cannot shift records under a reader.
 - **Replication**: Primary-replica model for read scaling
 - **Durability**: Write-ahead log with async batching
 - **Snapshots**: Point-in-time recovery system

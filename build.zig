@@ -279,6 +279,35 @@ pub fn build(b: *std.Build) void {
 
     const run_wal_delete_unit_tests = b.addRunArtifact(wal_delete_unit_tests);
 
+    // Ordering, clean shutdown, replay isolation, and reopening an existing
+    // log. These are the WAL promises the format tests do not cover.
+    const wal_guarantees_test_mod = b.createModule(.{
+        .root_source_file = b.path("tests/test_wal_guarantees.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    wal_guarantees_test_mod.addImport("wildb_lib", lib_mod);
+
+    const wal_guarantees_unit_tests = b.addTest(.{
+        .root_module = wal_guarantees_test_mod,
+    });
+
+    const run_wal_guarantees_unit_tests = b.addRunArtifact(wal_guarantees_unit_tests);
+
+    // A background writer must not shift records under a reader.
+    const concurrent_access_test_mod = b.createModule(.{
+        .root_source_file = b.path("tests/test_concurrent_access.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    concurrent_access_test_mod.addImport("wildb_lib", lib_mod);
+
+    const concurrent_access_unit_tests = b.addTest(.{
+        .root_module = concurrent_access_test_mod,
+    });
+
+    const run_concurrent_access_unit_tests = b.addRunArtifact(concurrent_access_unit_tests);
+
     // Similar to creating the run step earlier, this exposes a `test` step to
     // the `zig build --help` menu, providing a way for the user to request
     // running the unit tests.
@@ -290,6 +319,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_storage_unit_tests.step);
     test_step.dependOn(&run_batch_read_unit_tests.step);
     test_step.dependOn(&run_wal_delete_unit_tests.step);
+    test_step.dependOn(&run_wal_guarantees_unit_tests.step);
+    test_step.dependOn(&run_concurrent_access_unit_tests.step);
 
     // Zig analyses code lazily: a function nothing calls is never type-checked.
     // deep_check_main.zig references every public declaration, so the compiler

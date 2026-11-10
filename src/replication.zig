@@ -151,6 +151,11 @@ pub const PrimaryReplicator = struct {
     // Reference to database storage for snapshot creation
     database_storage: *flat_hash_storage.FlatHashStorage,
 
+    // Scratch space for a bootstrap snapshot, allocated before the static
+    // allocator freezes. A bootstrap used to allocate the whole table on the
+    // replication thread, which panics once the allocator is static.
+    snapshot_records: []flat_hash_storage.CacheLineRecord,
+
     // Statistics
     batches_replicated: std.atomic.Value(u64),
     replicas_connected: std.atomic.Value(u32),
@@ -178,6 +183,12 @@ pub const PrimaryReplicator = struct {
         // Pre-allocate all replica connection memory
         const replica_connections = try allocator.alloc(ReplicaConnection, MAX_REPLICAS);
         const replica_send_buffers = try allocator.alloc([]u8, MAX_REPLICAS);
+        const capacity = database_storage.getStats().total_capacity;
+        const snapshot_records = try allocator.alignedAlloc(
+            flat_hash_storage.CacheLineRecord,
+            @fromBackingInt(@intCast(6)),
+            capacity,
+        );
 
         // Pre-allocate send buffers for all potential replicas
         for (replica_send_buffers) |*buffer| {
@@ -210,6 +221,7 @@ pub const PrimaryReplicator = struct {
             .allocator = allocator,
             .auth_secret = auth_secret,
             .database_storage = database_storage,
+            .snapshot_records = snapshot_records,
             .batches_replicated = std.atomic.Value(u64).init(0),
             .replicas_connected = std.atomic.Value(u32).init(0),
             .replication_errors = std.atomic.Value(u64).init(0),
@@ -233,6 +245,7 @@ pub const PrimaryReplicator = struct {
         }
         self.allocator.free(self.replica_send_buffers);
         self.allocator.free(self.replica_connections);
+        self.allocator.free(self.snapshot_records);
 
         os_compat.close(self.listen_fd);
     }
@@ -343,6 +356,8 @@ pub const PrimaryReplicator = struct {
             os_compat.close(replica_fd);
             _ = self.replication_errors.fetchAdd(1, .monotonic);
         }
+
+        self.updateRetention();
     }
 
     fn cleanupDisconnectedReplicas(self: *Self) void {
@@ -362,6 +377,8 @@ pub const PrimaryReplicator = struct {
                 _ = self.replicas_connected.fetchSub(1, .monotonic);
             }
         }
+
+        self.updateRetention();
     }
 
     // Stream a WAL batch to all connected replicas
@@ -382,6 +399,8 @@ pub const PrimaryReplicator = struct {
         if (batches_sent > 0) {
             _ = self.batches_replicated.fetchAdd(1, .monotonic);
         }
+
+        self.updateRetention();
     }
 
     fn processBootstrapRequests(self: *Self) void {
@@ -397,6 +416,8 @@ pub const PrimaryReplicator = struct {
                 }
             }
         }
+
+        self.updateRetention();
     }
 
     fn checkForBootstrapRequest(self: *Self, replica: *ReplicaConnection) void {
@@ -436,12 +457,12 @@ pub const PrimaryReplicator = struct {
     }
 
     fn startBootstrapSnapshot(self: *Self, replica: *ReplicaConnection) void {
-        // Create and send snapshot of current database state
+        // Create and send snapshot of current database state. The buffer is
+        // owned by the replicator, not this call, so there is nothing to free.
         const snapshot_data = self.createDatabaseSnapshot() catch {
             replica.is_bootstrapping.store(false, .release);
             return;
         };
-        defer self.allocator.free(snapshot_data);
 
         // Send snapshot in chunks if needed
         const chunk_size = replica.send_buffer.len - @sizeOf(ReplicationMessage);
@@ -506,40 +527,22 @@ pub const PrimaryReplicator = struct {
         _ = replica;
     }
 
-    fn createDatabaseSnapshot(self: *Self) ![]u8 {
-        // Create a snapshot of the current database state
-        // We'll serialize all valid records in the flat hash storage
+    fn createDatabaseSnapshot(self: *Self) ![]const u8 {
+        // Copy the whole table under the storage guard, then compact the valid
+        // records into the front of the pre-allocated buffer. `getRecordAtSlot`
+        // takes no lock, so this must not walk slot by slot from the
+        // replication thread while the server writes.
+        const records = self.snapshot_records;
+        self.database_storage.copyAllRecords(records);
 
-        const storage_stats = self.database_storage.getStats();
-        const max_records = storage_stats.total_capacity;
-
-        // Calculate maximum possible snapshot size
-        const max_snapshot_size = max_records * @sizeOf(flat_hash_storage.CacheLineRecord);
-        const snapshot_data = try self.allocator.alloc(u8, max_snapshot_size);
-        var snapshot_offset: usize = 0;
-
-        // Iterate through all storage slots and copy valid records
-        for (0..max_records) |slot_index| {
-            if (self.database_storage.getRecordAtSlot(@intCast(slot_index))) |record| {
-                if (record.isValid()) {
-                    const record_bytes = std.mem.asBytes(record);
-                    @memcpy(snapshot_data[snapshot_offset .. snapshot_offset + record_bytes.len], record_bytes);
-                    snapshot_offset += record_bytes.len;
-                }
-            }
+        var used: usize = 0;
+        for (records, 0..) |*record, slot| {
+            if (!record.isValid() or record.isDelete()) continue;
+            if (used != slot) records[used] = record.*;
+            used += 1;
         }
 
-        // Resize to actual size used
-        if (snapshot_offset == 0) {
-            self.allocator.free(snapshot_data);
-            return try self.allocator.alloc(u8, 0); // Empty snapshot
-        }
-
-        const final_snapshot = try self.allocator.alloc(u8, snapshot_offset);
-        @memcpy(final_snapshot, snapshot_data[0..snapshot_offset]);
-        self.allocator.free(snapshot_data);
-
-        return final_snapshot;
+        return std.mem.sliceAsBytes(records[0..used]);
     }
 
     fn checkReplicaLag(self: *Self, current_batch_id: u64) void {
@@ -561,13 +564,19 @@ pub const PrimaryReplicator = struct {
         const lag = current_batch_id - replica_batch_id;
         std.debug.print("Replica lag detected: {} batches behind, initiating catch-up\n", .{lag});
 
-        // For small lags, try streaming missing WAL batches first
-        if (lag <= MAX_LAG_BATCHES / 4) { // Quarter of max threshold
-            std.debug.print("Attempting WAL file streaming for catch-up\n", .{});
+        // PostgreSQL streams WAL until the needed segment is gone, then makes
+        // the standby resync. Do the same: the retention cap is the point past
+        // which streaming cannot help. `streamMissingBatches` still bootstraps
+        // if a segment inside that window was already removed.
+        const mb = 1024 * 1024;
+        const retained_batches = (@as(u64, @max(1, self.wal_manager.config.max_wal_size_mb)) * mb) /
+            @sizeOf(wal.WALBatch);
+
+        if (lag <= retained_batches) {
+            std.debug.print("Streaming missing WAL for catch-up\n", .{});
             self.streamMissingBatches(replica, replica_batch_id, current_batch_id);
         } else {
-            // For large lags, use full snapshot bootstrap
-            std.debug.print("Large lag detected, using snapshot bootstrap\n", .{});
+            std.debug.print("Replica is beyond retained WAL, using snapshot bootstrap\n", .{});
             replica.is_bootstrapping.store(true, .release);
             replica.bootstrap_last_batch_requested.store(replica_batch_id, .release);
             self.startBootstrapSnapshot(replica);
@@ -575,54 +584,61 @@ pub const PrimaryReplicator = struct {
     }
 
     fn streamMissingBatches(self: *Self, replica: *ReplicaConnection, from_batch: u64, to_batch: u64) void {
-        // Stream missing WAL batches from persistent files for efficient catch-up
+        // Stream missing WAL batches from persistent files for efficient catch-up.
         if (to_batch <= from_batch) return;
 
-        // Read missing batches from WAL files and stream them
-        for (from_batch + 1..to_batch + 1) |batch_id| {
-            if (self.readWALBatchFromDisk(@intCast(batch_id))) |batch| {
+        // A batch can have an id before its write completes. Stopping at the
+        // durable watermark avoids a bootstrap just because the newest batch
+        // is still in flight; that batch is still on the live stream.
+        const durable_end = self.wal_manager.lastDurableBatch() orelse return;
+        const last_batch = @min(to_batch, durable_end);
+        if (last_batch <= from_batch) return;
+
+        // Read missing batches from WAL segments and stream them. The WAL
+        // manager owns the file list and the active-segment watermark, so the
+        // replication thread never walks that metadata without its lock.
+        for (from_batch + 1..last_batch + 1) |batch_id| {
+            if (self.wal_manager.readBatch(batch_id)) |batch| {
                 const current_view = self.view_number.load(.acquire);
                 if (!replica.sendWALBatch(current_view, &batch)) {
                     // Failed to send, replica will be marked unhealthy
                     break;
                 }
             } else {
-                // Batch not found on disk, may have been garbage collected
-                // Fall back to bootstrap for this replica
+                // The batch is not durable yet, or retention removed the
+                // segment. A full snapshot is the only safe recovery.
                 replica.is_bootstrapping.store(true, .release);
                 self.startBootstrapSnapshot(replica);
                 break;
             }
         }
+
+        self.updateRetention();
     }
 
-    fn readWALBatchFromDisk(self: *Self, batch_id: u64) ?wal.WALBatch {
-        // Read a specific WAL batch from persistent storage
-        // This would integrate with the WAL file management system
+    /// Tell WAL retention how far back a replica still needs batches. Only a
+    /// connected, non-bootstrapping replica can catch up from WAL: a new or
+    /// resyncing replica receives a snapshot. `retain_from` is the first batch
+    /// that replica has not consumed.
+    fn updateRetention(self: *Self) void {
+        var oldest_needed: ?u64 = null;
 
-        if (self.wal_manager.wal_files.items.len == 0) return null;
+        for (self.replica_connections) |*replica| {
+            if (replica.socket_fd == -1) continue;
+            if (!replica.is_connected.load(.acquire)) continue;
+            if (replica.is_bootstrapping.load(.acquire)) continue;
 
-        // Search through WAL files for the requested batch
-        for (self.wal_manager.wal_files.items) |*wal_file| {
-            if (batch_id >= wal_file.start_batch_id and batch_id <= wal_file.end_batch_id) {
-                // Found the right file, read the batch
-                const file = os_compat.openFile(wal_file.file_path, .{}) catch return null;
-                defer file.close();
-
-                // Calculate offset for this batch in the file
-                const batch_offset = (batch_id - wal_file.start_batch_id) * @sizeOf(wal.WALBatch);
-                file.seekTo(batch_offset) catch return null;
-
-                var batch: wal.WALBatch = undefined;
-                const bytes_read = file.readAll(std.mem.asBytes(&batch)) catch return null;
-
-                if (bytes_read == @sizeOf(wal.WALBatch) and batch.batch_id == batch_id) {
-                    return batch;
-                }
+            const last = replica.last_batch_id.load(.acquire);
+            if (oldest_needed == null or last < oldest_needed.?) {
+                oldest_needed = last;
             }
         }
 
-        return null;
+        if (oldest_needed) |last| {
+            self.wal_manager.setRetainFromBatchId(last +| 1);
+        } else {
+            self.wal_manager.clearRetainFromBatchId();
+        }
     }
 
     fn streamPendingBatches(self: *Self) void {
@@ -857,31 +873,10 @@ pub const ReplicaNode = struct {
     }
 
     fn processSnapshotData(self: *Self, snapshot_data: []const u8, sequence_id: u64) void {
-        // Process snapshot data chunks
-        // For now, implement a simple approach that applies records directly
-
-        // Snapshot data format: sequence of CacheLineRecord structures
-        var offset: usize = 0;
-        while (offset + @sizeOf(flat_hash_storage.CacheLineRecord) <= snapshot_data.len) {
-            const record_bytes = snapshot_data[offset .. offset + @sizeOf(flat_hash_storage.CacheLineRecord)];
-            const record = std.mem.bytesToValue(flat_hash_storage.CacheLineRecord, record_bytes);
-
-            // A marker is never valid snapshot contents, so a bootstrap that
-            // carries one is corrupt. Skip it rather than store an occupied
-            // slot that no probe can reach.
-            if (record.isValid() and !record.isDelete()) {
-                const key = record.getKey();
-                const data = record.getData();
-
-                // Apply the record to our replica database
-                self.database.write(key, data) catch {
-                    _ = self.connection_errors.fetchAdd(1, .monotonic);
-                    continue;
-                };
-            }
-
-            offset += @sizeOf(flat_hash_storage.CacheLineRecord);
-        }
+        // Snapshot data is a packed sequence of cache-line records. Applying it
+        // through the storage guard makes the whole chunk one critical section,
+        // so a client cannot observe half a bootstrap.
+        _ = self.database.storage.applySnapshotBytes(snapshot_data);
 
         // Update our sequence tracking
         _ = sequence_id; // For now, just acknowledge receipt
@@ -935,19 +930,18 @@ pub const ReplicaNode = struct {
     }
 
     fn applyWALBatch(self: *Self, batch: *const wal.WALBatch) void {
-        // Apply each entry in the batch to our local database
-        for (batch.entries[0..batch.entry_count]) |*entry| {
-            if (entry.isValid()) {
-                // A write stores the value and a marker removes the key, which
-                // is the same rule replay follows. Applied straight as a write,
-                // a marker would resurrect the key on this replica while the
-                // primary had it gone.
-                self.database.storage.applyEntry(entry) catch {
-                    // On failure, increment error counter and continue
-                    _ = self.connection_errors.fetchAdd(1, .monotonic);
-                    continue;
-                };
-            }
+        // Apply the batch as one critical section. A write stores the value and
+        // a marker removes the key, which is the rule replay follows; storage
+        // reads the marker once, for all three callers.
+        const entries = batch.entries[0..batch.entry_count];
+        var valid: usize = 0;
+        for (entries) |entry| {
+            if (entry.isValid()) valid += 1;
+        }
+
+        const applied = self.database.storage.applyEntries(entries);
+        if (applied < valid) {
+            _ = self.connection_errors.fetchAdd(valid - applied, .monotonic);
         }
 
         self.last_applied_batch.store(batch.batch_id, .release);

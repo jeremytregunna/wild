@@ -12,6 +12,19 @@ const os_compat = @import("os_compat.zig");
 const linux = std.os.linux;
 const posix = std.posix;
 
+// Raw `linux.openat` and friends take a NUL-terminated path. A runtime-built
+// path — `std.fmt.allocPrint`, a WAL file number, a CLI argument — is an
+// ordinary slice, so passing `path.ptr` reads past its end. One thread-local
+// buffer is enough: these calls do not yield, and each thread has its own.
+threadlocal var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+
+fn toPathZ(path: []const u8) ?[*:0]const u8 {
+    if (path.len >= path_buffer.len) return null;
+    @memcpy(path_buffer[0..path.len], path);
+    path_buffer[path.len] = 0;
+    return @ptrCast(&path_buffer);
+}
+
 pub const fd_t = posix.fd_t;
 pub const sockaddr = posix.sockaddr;
 pub const socklen_t = posix.socklen_t;
@@ -226,7 +239,8 @@ pub fn fcntl(fd: fd_t, cmd: u32, arg: usize) SocketError!usize {
 }
 
 pub fn unlink(path: []const u8) SocketError!void {
-    _ = try check(linux.unlink(@ptrCast(path.ptr)));
+    const c_path = toPathZ(path) orelse return error.NameTooLong;
+    _ = try check(linux.unlink(c_path));
 }
 
 // ---------------------------------------------------------------------------
@@ -349,7 +363,8 @@ pub const Mutex = struct {
 // `std.Io`. Snapshots and WAL recovery have no `std.Io` to pass, so these
 // wrappers keep the old signatures over direct syscalls.
 //
-// Paths must be NUL-terminated, like `std.posix.openat`.
+// Paths are ordinary slices, not NUL-terminated pointers. The syscall helpers
+// copy them through `toPathZ` first.
 // ---------------------------------------------------------------------------
 
 pub const FileError = error{
@@ -485,9 +500,10 @@ pub fn createFile(path: []const u8, opts: FileOpenOptions) FileError!File {
 }
 
 fn openFileAt(path: []const u8, opts: FileOpenOptions, create: bool) FileError!File {
+    const c_path = toPathZ(path) orelse return error.NameTooLong;
     const rc = linux.openat(
         linux.AT.FDCWD,
-        @ptrCast(path.ptr),
+        c_path,
         openFlags(opts, create),
         0o644,
     );
@@ -496,12 +512,14 @@ fn openFileAt(path: []const u8, opts: FileOpenOptions, create: bool) FileError!F
 
 /// Replacement for `os_compat.deleteFile(path)`.
 pub fn deleteFile(path: []const u8) FileError!void {
-    _ = try fileCheck(linux.unlinkat(linux.AT.FDCWD, @ptrCast(path.ptr), 0));
+    const c_path = toPathZ(path) orelse return error.NameTooLong;
+    _ = try fileCheck(linux.unlinkat(linux.AT.FDCWD, c_path, 0));
 }
 
 /// Replacement for `os_compat.makeDir(path)`.
 pub fn makeDir(path: []const u8) FileError!void {
-    _ = try fileCheck(linux.mkdirat(linux.AT.FDCWD, @ptrCast(path.ptr), 0o755));
+    const c_path = toPathZ(path) orelse return error.NameTooLong;
+    _ = try fileCheck(linux.mkdirat(linux.AT.FDCWD, c_path, 0o755));
 }
 
 pub const Kind = enum { file, directory, unknown };
@@ -526,9 +544,10 @@ pub const Dir = struct {
         return .{ .dir = self };
     }
 
-    /// Replacement for `std.fs.Dir.deleteFile`. `path` must be NUL-terminated.
+    /// Replacement for `std.fs.Dir.deleteFile`.
     pub fn deleteFile(self: *Dir, path: []const u8) FileError!void {
-        _ = try fileCheck(linux.unlinkat(self.handle, @ptrCast(path.ptr), 0));
+        const c_path = toPathZ(path) orelse return error.NameTooLong;
+        _ = try fileCheck(linux.unlinkat(self.handle, c_path, 0));
     }
 
     pub const Iterator = struct {
