@@ -20,6 +20,10 @@ pub const flat_hash_storage = @import("flat_hash_storage.zig");
 pub const FlatHashStorage = flat_hash_storage.FlatHashStorage;
 pub const CacheLineRecord = flat_hash_storage.CacheLineRecord;
 
+// Re-export the routing rule. WAL replay and replica apply have to route a
+// key the same way the request path does, so it cannot live inside either.
+pub const partition = @import("partition.zig");
+
 // Re-export the pieces an end-to-end test needs to start the server and talk
 // to it with the real client.
 pub const wild = @import("wild.zig");
@@ -33,6 +37,13 @@ pub const os_compat = @import("os_compat.zig");
 // writer in wal.zig and the reader in snapshot.zig.
 pub const wal = @import("wal.zig");
 pub const snapshot = @import("snapshot.zig");
+
+// Nothing else references every module: the router is imported for replay
+// and replica apply, and its own guarantees ("one key, one table") are only
+// tested if the test runner reaches it.
+test {
+    testing.refAllDecls(@This());
+}
 
 test "cache topology analysis" {
     const allocator = std.testing.allocator;
