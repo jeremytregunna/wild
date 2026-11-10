@@ -332,7 +332,12 @@ pub const TableSet = struct {
 
     /// The table that owns a key. The one place in this file that picks a
     /// table, so the request path and the rebuilding paths cannot disagree.
+    ///
+    /// One table short-circuits: every key routes to it, so paying the mixing
+    /// function per operation would be a cost the unpartitioned store does not
+    /// have and does not need.
     pub fn tableFor(self: *const Self, key: u64) *Table {
+        if (self.tables.len == 1) return &self.tables[0];
         return &self.tables[partition.tableOfKey(key, self.count())];
     }
 
