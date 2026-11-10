@@ -58,9 +58,9 @@ WILD leverages modern CPU architecture for extreme performance:
 ### Core Design
 - **Cache-Line Aligned Records**: 64-byte records fit exactly in CPU cache lines
 - **Flat Hash Storage**: Linear probing with bitwise operations
-- **CPU Topology Detection**: CPUID on every CPU the process may use reports cores, SMT siblings, L2/L3 domains, cache line size, and the NUMA zone each cache sits in, including two zones on one socket. It reports; it does not place memory or pin threads yet.
+- **Zone-Local Tables**: CPUID on every CPU the process may use reports cores, SMT siblings, L2/L3 domains, cache line size, and the NUMA zone each cache sits in, including two zones on one socket. Each zone gets its own table, bound to that zone's kernel node and first touched by a thread pinned to its cores, so a write does not cross a zone boundary. One zone means one table and no extra thread.
 - **Zero Runtime Allocation**: Static allocator eliminates allocation overhead
-- **One Owning Thread**: The table is driven by a single thread. Replication and snapshot walks take a storage guard first, so a second thread cannot shift records under a reader.
+- **One Owning Thread per Table**: A table is driven by a single thread. Replication and snapshot walks take a storage guard first, so a second thread cannot shift records under a reader.
 - **Replication**: Primary-replica model for read scaling
 - **Durability**: Write-ahead log with async batching
 - **Snapshots**: Point-in-time recovery system
