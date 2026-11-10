@@ -202,3 +202,111 @@ test "a snapshot round-trips two tables" {
         try testing.expect(stranger.storage.read(key) == null);
     }
 }
+
+test "a torn WAL tail recovers the last complete batch, on both tables" {
+    // The SIGKILL model: the log ends wherever the last write stopped, and
+    // recovery has to come back to a state the log actually describes. Batches
+    // are fixed-size pages, so a cut lands either between batches (the whole
+    // tail goes) or inside one (the incomplete page is skipped, never applied
+    // halfway). What must never happen is a key in the wrong table, or a value
+    // the log never held.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var topology = wildb_lib.analyzeCacheTopology(alloc) catch return;
+    defer topology.deinit();
+
+    // One key per table, found by routing rather than assumed.
+    var key_for_table: [2]u64 = .{ 0, 0 };
+    var found: u2 = 0;
+    var candidate: u64 = 1;
+    while (found != 3) : (candidate += 1) {
+        const table = partition.tableOfKey(candidate, 2);
+        if (key_for_table[table] == 0) {
+            key_for_table[table] = candidate;
+            found |= @as(u2, 1) << @intCast(table);
+        }
+    }
+    const a = key_for_table[0];
+    const b = key_for_table[1];
+
+    // Batch 0 writes both keys. Batch 1 deletes the first and writes a third.
+    // Batch 2 puts the second key back with a new value.
+    var batches: [3]wal.WALBatch = .{
+        wal.WALBatch.init(0, 1),
+        wal.WALBatch.init(1, 1),
+        wal.WALBatch.init(2, 1),
+    };
+    const first = try CacheLineRecord.init(a, "first");
+    const first_b = try CacheLineRecord.init(b, "first");
+    const third = try CacheLineRecord.init(a + 100_000, "third");
+    const later = try CacheLineRecord.init(b, "later");
+    try testing.expect(batches[0].addEntry(wal.WALEntry.fromCacheLineRecord(&first)));
+    try testing.expect(batches[0].addEntry(wal.WALEntry.fromCacheLineRecord(&first_b)));
+    try testing.expect(batches[1].addEntry(wal.WALEntry.fromCacheLineRecord(&CacheLineRecord.initDelete(a))));
+    try testing.expect(batches[1].addEntry(wal.WALEntry.fromCacheLineRecord(&third)));
+    try testing.expect(batches[2].addEntry(wal.WALEntry.fromCacheLineRecord(&later)));
+
+    const page = @sizeOf(wal.WALBatch);
+    const image = std.mem.sliceAsBytes(&batches);
+
+    os_compat.makeDir(scratch_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+
+    var path_buffer: [256]u8 = undefined;
+    const wal_path = try std.fmt.bufPrint(&path_buffer, "{s}/torn-tail.wal", .{scratch_dir});
+
+    // Every write boundary the process could have been killed at, plus one in
+    // the middle of a page.
+    const cuts = [_]usize{ 0, page / 2, page, page + page / 3, 2 * page, image.len };
+    for (cuts) |cut| {
+        var store = (try newTables(&topology, alloc, 1024)) orelse return;
+        defer store.deinit();
+
+        {
+            const file = try os_compat.createFile(wal_path, .{ .truncate = true });
+            defer file.close();
+            try file.writeAll(image[0..cut]);
+        }
+        defer os_compat.deleteFile(wal_path) catch {};
+
+        var replayer = snapshot.WALReplayer.init(alloc, wal_path);
+        _ = try replayer.replayFromPosition(&store, 0, null);
+
+        // The state the surviving prefix of the log describes.
+        const complete = cut / page;
+        const expect_a: ?[]const u8 = if (complete >= 2) null else if (complete >= 1) "first" else null;
+        const expect_b: ?[]const u8 = if (complete >= 3) "later" else if (complete >= 1) "first" else null;
+        const expect_third = complete >= 2;
+
+        const got_a = try store.read(a);
+        if (expect_a) |value| {
+            try testing.expect(got_a != null);
+            try testing.expectEqualStrings(value, got_a.?.getData());
+        } else {
+            try testing.expect(got_a == null);
+        }
+
+        const got_b = try store.read(b);
+        if (expect_b) |value| {
+            try testing.expect(got_b != null);
+            try testing.expectEqualStrings(value, got_b.?.getData());
+        } else {
+            try testing.expect(got_b == null);
+        }
+
+        try testing.expectEqual(expect_third, (try store.read(a + 100_000)) != null);
+
+        // Nothing recovered into a table that does not own it, at any cut.
+        for (store.tables, 0..) |table, index| {
+            for (&[_]u64{ a, b, a + 100_000 }) |key| {
+                if (table.storage.read(key) != null) {
+                    try testing.expectEqual(partition.tableOfKey(key, 2), index);
+                }
+            }
+        }
+    }
+}
