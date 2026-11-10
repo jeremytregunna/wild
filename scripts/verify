@@ -54,11 +54,23 @@ check "zig version is 0.17.x" bash -c '
         exit 1
     fi'
 
-# 2 — The declared floor must not exceed the toolchain in use.
-check "minimum_zig_version matches the toolchain" bash -c '
+# 2 — The declared floor must not exceed the toolchain in use. The minor
+#     must match, because Zig promises nothing across minors; the patch level
+#     may drift, so a floor of 0.17.0 is fine on 0.17.1.
+check "minimum_zig_version is this toolchain's minor or older" bash -c '
     declared=$(sed -n "s/.*minimum_zig_version = \"\([0-9.]*\)\".*/\1/p" build.zig.zon)
     running=$(zig version)
-    [ "$declared" = "$running" ] || { echo "build.zig.zon says $declared, zig is $running"; exit 1; }'
+    d_minor=${declared%.*}
+    r_minor=${running%.*}
+    [ "$d_minor" = "$r_minor" ] || { echo "build.zig.zon says $declared, zig is $running: the minor must match"; exit 1; }
+    d_patch=${declared##*.}
+    r_patch=${running##*.}
+    if ! [[ "$d_patch" =~ ^[0-9]+$ ]] || ! [[ "$r_patch" =~ ^[0-9]+$ ]]; then
+        echo "note: $declared / $running: patch level is not numeric, minor match is all that is checked"
+    elif [ "$d_patch" -gt "$r_patch" ]; then
+        echo "build.zig.zon says $declared, zig is $running: the declared floor is newer than the toolchain"
+        exit 1
+    fi'
 
 # 3 — Format. The repository is not fmt-clean at the migration baseline, so
 #     this is a warning. Fix it in its own commit, never inside a migration.
