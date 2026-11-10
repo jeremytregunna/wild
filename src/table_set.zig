@@ -562,12 +562,19 @@ pub const TableSet = struct {
 
     /// Apply a batch of log entries, one owner per table.
     ///
-    /// Each table's slice is applied in a single critical section, so readers
-    /// of that table see the batch whole. A batch whose keys span two tables
-    /// is therefore two critical sections, not one: the tables are independent
-    /// and nothing orders them against each other. That was already true of
-    /// two clients writing concurrently before partitioning existed, and it is
-    /// the price of keeping writes inside their zones.
+    /// A batch normally belongs to one table: a WAL batch is drained from one
+    /// thread's ring, and a table is only written by its owner. In that case
+    /// this is the same single critical section it was before partitioning,
+    /// and a reader cannot see half of it.
+    ///
+    /// A batch can carry keys from two tables in exactly one production case:
+    /// a replica whose zone count differs from the primary's. The batch is
+    /// homogeneous in the *primary's* tables, but routing applies this node's
+    /// count to the bucket, so one primary table's buckets land in several
+    /// local tables. Then the tables are applied in separate critical
+    /// sections and nothing orders them against each other: a reader can see
+    /// one table's part of that batch before the other's. A single table, or a
+    /// replica with the same count as its primary, is unaffected.
     ///
     /// Returns how many entries were applied, across all tables.
     pub fn applyEntries(self: *Self, entries: []const wal.WALEntry) usize {
