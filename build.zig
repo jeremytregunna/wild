@@ -308,6 +308,21 @@ pub fn build(b: *std.Build) void {
 
     const run_concurrent_access_unit_tests = b.addRunArtifact(concurrent_access_unit_tests);
 
+    // Replay and snapshot restore have to route by key, not by the sender's
+    // table numbering.
+    const numa_partitions_test_mod = b.createModule(.{
+        .root_source_file = b.path("tests/test_numa_partitions.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    numa_partitions_test_mod.addImport("wildb_lib", lib_mod);
+
+    const numa_partitions_unit_tests = b.addTest(.{
+        .root_module = numa_partitions_test_mod,
+    });
+
+    const run_numa_partitions_unit_tests = b.addRunArtifact(numa_partitions_unit_tests);
+
     // Similar to creating the run step earlier, this exposes a `test` step to
     // the `zig build --help` menu, providing a way for the user to request
     // running the unit tests.
@@ -321,6 +336,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_wal_delete_unit_tests.step);
     test_step.dependOn(&run_wal_guarantees_unit_tests.step);
     test_step.dependOn(&run_concurrent_access_unit_tests.step);
+    test_step.dependOn(&run_numa_partitions_unit_tests.step);
 
     // Zig analyses code lazily: a function nothing calls is never type-checked.
     // deep_check_main.zig references every public declaration, so the compiler

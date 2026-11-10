@@ -925,3 +925,97 @@ test "concurrent callers do not lose a write" {
         try testing.expect(found != null);
     }
 }
+
+test "a batch apply keeps each entry in the table its key routes to" {
+    var topology = try testTopology(testing.allocator);
+    defer topology.deinit();
+
+    var set = try TableSet.init(testing.allocator, &topology, 1024, 2);
+    defer set.deinit();
+
+    // Two keys on the same table and one on the other, so a batch that is
+    // applied wholesale to every table would show up as a foreign record.
+    const keys = [_]u64{ 11, 22, 33 };
+    var entries: [keys.len]wal.WALEntry = undefined;
+    for (keys, 0..) |key, index| {
+        var record = try CacheLineRecord.init(key, "batched");
+        entries[index] = wal.WALEntry.fromCacheLineRecord(&record);
+    }
+
+    var routed: [2]usize = .{ 0, 0 };
+    for (keys) |key| routed[partition.tableOfKey(key, 2)] += 1;
+
+    const applied = set.applyEntries(&entries);
+    try testing.expectEqual(@as(usize, keys.len), applied);
+
+    // Every key is visible through routing...
+    for (keys) |key| {
+        const found = try set.read(key);
+        try testing.expect(found != null);
+    }
+
+    // ...and no key is stored in a table that does not own it. A foreign
+    // record is worse than a miss: the count would say the key is there while
+    // every lookup searches the other table.
+    for (keys) |key| {
+        const owner = set.tables[partition.tableOfKey(key, 2)];
+        const stranger = set.tables[1 - partition.tableOfKey(key, 2)];
+        try testing.expect(owner.storage.read(key) != null);
+        try testing.expect(stranger.storage.read(key) == null);
+    }
+
+    for (set.tables, 0..) |table, index| {
+        try testing.expectEqual(@as(u32, @intCast(routed[index])), table.storage.count);
+    }
+}
+
+test "a bootstrap snapshot keeps each record in the table its key routes to" {
+    var topology = try testTopology(testing.allocator);
+    defer topology.deinit();
+
+    var set = try TableSet.init(testing.allocator, &topology, 1024, 2);
+    defer set.deinit();
+
+    const keys = [_]u64{ 4, 8, 15, 16, 23, 42 };
+    var records: [keys.len]CacheLineRecord = undefined;
+    for (keys, 0..) |key, index| records[index] = try CacheLineRecord.init(key, "from-primary");
+
+    // The payload a primary sends: a packed run of 64-byte records, keys and
+    // all. The receiver has to route them; it cannot know the sender's tables.
+    const bytes = std.mem.sliceAsBytes(&records);
+    const applied = set.applySnapshotBytes(bytes);
+    try testing.expectEqual(keys.len, applied);
+
+    for (keys) |key| {
+        const found = try set.read(key);
+        try testing.expect(found != null);
+
+        const owner = set.tables[partition.tableOfKey(key, 2)];
+        const stranger = set.tables[1 - partition.tableOfKey(key, 2)];
+        try testing.expect(owner.storage.read(key) != null);
+        try testing.expect(stranger.storage.read(key) == null);
+    }
+}
+
+test "restoring a snapshot places each record by its key" {
+    var topology = try testTopology(testing.allocator);
+    defer topology.deinit();
+
+    var set = try TableSet.init(testing.allocator, &topology, 1024, 2);
+    defer set.deinit();
+
+    const keys = [_]u64{ 5, 6 };
+    var records: [keys.len]CacheLineRecord = undefined;
+    for (keys, 0..) |key, index| records[index] = try CacheLineRecord.init(key, "restored");
+
+    for (&records) |*record| try set.restoreRecord(record);
+
+    for (keys) |key| {
+        const found = try set.read(key);
+        try testing.expect(found != null);
+        // Restore may not leave the record in the wrong table either: the
+        // snapshot file has no table field, only keys.
+        const stranger = set.tables[1 - partition.tableOfKey(key, 2)];
+        try testing.expect(stranger.storage.read(key) == null);
+    }
+}
