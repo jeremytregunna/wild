@@ -50,12 +50,6 @@ pub const WILD = struct {
         const topology_ptr = try allocator.create(cache_topology.CacheTopology);
         topology_ptr.* = try cache_topology.analyzeCacheTopology(allocator);
 
-        // Calculate total L3 cache size for validation
-        var total_l3_cache_kb: u64 = 0;
-        for (topology_ptr.l3_domains) |domain| {
-            total_l3_cache_kb += domain.cache_size_kb;
-        }
-
         // Initialize flat hash storage using static allocator
         const storage = try flat_hash_storage.FlatHashStorage.init(allocator, topology_ptr, config.target_capacity);
 

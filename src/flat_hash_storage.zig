@@ -136,9 +136,11 @@ pub const FlatHashStorage = struct {
     // Optional WAL for durability - null means no durability
     durability_manager: ?*wal.DurabilityManager,
 
-    // NUMA placement hints (for future optimization)
-    numa_domains: u32,
-    records_per_domain: u32,
+    // L3 domains the machine reports. The whole table is one allocation, so
+    // this is a report, not a placement decision: nothing here splits records
+    // across zones. A caller that wants per-zone placement has to allocate
+    // per zone first.
+    l3_domains: u32,
 
     pub fn init(allocator: std.mem.Allocator, topology: *const cache_topology.CacheTopology, target_capacity: u64) !Self {
         // Enforce power-of-2 capacity for bitwise operations
@@ -162,10 +164,6 @@ pub const FlatHashStorage = struct {
             record.* = CacheLineRecord.initEmpty();
         }
 
-        // Calculate NUMA domain distribution for future optimization
-        const numa_domains = @as(u32, @intCast(topology.l3_domains.len));
-        const records_per_domain = capacity / numa_domains;
-
         return Self{
             .records = records,
             .capacity = capacity,
@@ -175,8 +173,7 @@ pub const FlatHashStorage = struct {
             .sync_enabled = false,
             .sync_mutex = os_compat.Mutex{},
             .durability_manager = null, // Initially no WAL
-            .numa_domains = numa_domains,
-            .records_per_domain = records_per_domain,
+            .l3_domains = @intCast(topology.l3_domains.len),
         };
     }
 
@@ -688,7 +685,7 @@ pub const FlatHashStorage = struct {
             .total_count = self.count,
             .total_capacity = self.capacity,
             .load_factor = @as(f32, @floatFromInt(self.count)) / @as(f32, @floatFromInt(self.capacity)),
-            .numa_domains = self.numa_domains,
+            .l3_domains = self.l3_domains,
         };
     }
 
@@ -697,7 +694,7 @@ pub const FlatHashStorage = struct {
 
         std.debug.print("\n=== Storage Statistics ===\n", .{});
         std.debug.print("Capacity: {}/{} records ({d:.1}% full)\n", .{ stats.total_count, stats.total_capacity, stats.load_factor * 100 });
-        std.debug.print("NUMA domains: {}\n", .{stats.numa_domains});
+        std.debug.print("L3 domains: {}\n", .{stats.l3_domains});
     }
 };
 
@@ -705,5 +702,6 @@ pub const StorageStats = struct {
     total_count: u32,
     total_capacity: u32,
     load_factor: f32,
-    numa_domains: u32,
+    /// L3 domains the machine reports, from the detected topology.
+    l3_domains: u32,
 };

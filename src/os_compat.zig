@@ -356,6 +356,54 @@ pub const Mutex = struct {
 };
 
 // ---------------------------------------------------------------------------
+// CPU affinity
+//
+// Topology detection asks every CPU what it is, and a CPU only answers about
+// itself, so the asking thread has to run there first. That is what pins are
+// for. These wrappers are the whole OS surface of `cache_topology.zig`: it is
+// called once at init, and the original mask is restored before it returns.
+//
+// `cpu_set_t` is a fixed bitmap of `CPU_SETSIZE / @sizeOf(usize) * 8` bits, so
+// the kernel call takes a byte count, not a CPU count.
+// ---------------------------------------------------------------------------
+
+/// The kernel's CPU bitmap, large enough for 1024 CPUs.
+pub const CpuSet = linux.cpu_set_t;
+
+/// CPUs one `CpuSet` can describe.
+pub const max_cpus: u32 = @as(u32, @sizeOf(CpuSet)) * 8;
+
+/// Fill `set` with the CPUs this process is allowed to run on.
+///
+/// Returns false when the kernel will not answer, which is what happens off
+/// Linux. The caller then reports no topology rather than guessing one.
+pub fn cpuAffinityGet(set: *CpuSet) bool {
+    @memset(std.mem.asBytes(set), 0);
+    const rc = linux.sched_getaffinity(0, @sizeOf(CpuSet), set);
+    return posix.errno(rc) == .SUCCESS;
+}
+
+/// Restrict the calling thread to `set`. Returns false if the kernel refuses.
+pub fn cpuAffinitySet(set: *const CpuSet) bool {
+    linux.sched_setaffinity(0, set) catch return false;
+    return true;
+}
+
+pub fn cpuSetContains(set: *const CpuSet, cpu: u32) bool {
+    if (cpu >= max_cpus) return false;
+    const word = cpu / @bitSizeOf(usize);
+    const bit = cpu % @bitSizeOf(usize);
+    return (set[word] & (@as(usize, 1) << @intCast(bit))) != 0;
+}
+
+pub fn cpuSetPut(set: *CpuSet, cpu: u32) void {
+    if (cpu >= max_cpus) return;
+    const word = cpu / @bitSizeOf(usize);
+    const bit = cpu % @bitSizeOf(usize);
+    set[word] |= @as(usize, 1) << @intCast(bit);
+}
+
+// ---------------------------------------------------------------------------
 // Files and directories
 //
 // Zig 0.16 removed `os_compat.File`, `std.fs.Dir`, and `std.fs.cwd()`. The
@@ -592,6 +640,65 @@ pub const OpenDirOptions = struct {
 /// Replacement for `std.fs.cwd().openDir(path, .{ .iterate = true })`.
 pub fn openDir(path: []const u8, opts: OpenDirOptions) FileError!Dir {
     if (!opts.iterate) @panic("os_compat.openDir supports only .iterate = true");
-    const rc = linux.openat(linux.AT.FDCWD, @ptrCast(path.ptr), .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
+    const c_path = toPathZ(path) orelse return error.NameTooLong;
+    const rc = linux.openat(linux.AT.FDCWD, c_path, .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
     return .{ .handle = @intCast(try fileCheck(rc)) };
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+test "a CPU bit lands on the CPU it names" {
+    var set = std.mem.zeroes(CpuSet);
+
+    // 0 and 63 share a word, 63 and 64 straddle two, 1023 is the last bit.
+    cpuSetPut(&set, 0);
+    cpuSetPut(&set, 63);
+    cpuSetPut(&set, 64);
+    cpuSetPut(&set, 1023);
+
+    try testing.expect(cpuSetContains(&set, 0));
+    try testing.expect(cpuSetContains(&set, 63));
+    try testing.expect(cpuSetContains(&set, 64));
+    try testing.expect(cpuSetContains(&set, 1023));
+
+    // Neighbours stay clear: bit placement is not off by one either way.
+    try testing.expect(!cpuSetContains(&set, 1));
+    try testing.expect(!cpuSetContains(&set, 62));
+    try testing.expect(!cpuSetContains(&set, 65));
+    try testing.expect(!cpuSetContains(&set, 1022));
+
+    var bits: usize = 0;
+    for (set) |word| bits += @popCount(word);
+    try testing.expectEqual(@as(usize, 4), bits);
+}
+
+test "a CPU id past the end of the set is dropped, not wrapped" {
+    var set = std.mem.zeroes(CpuSet);
+
+    cpuSetPut(&set, max_cpus);
+    cpuSetPut(&set, 10_000);
+
+    try testing.expect(!cpuSetContains(&set, max_cpus));
+    try testing.expect(!cpuSetContains(&set, 10_000));
+    for (set) |word| try testing.expectEqual(@as(usize, 0), word);
+}
+
+test "reading the affinity mask twice gives the same mask" {
+    // Read only: setting a mask from a test would restrict the whole test
+    // process if the test failed halfway through.
+    var first: CpuSet = undefined;
+    if (!cpuAffinityGet(&first)) return error.SkipZigTest;
+
+    var second: CpuSet = undefined;
+    try testing.expect(cpuAffinityGet(&second));
+    try testing.expectEqualSlices(u8, std.mem.asBytes(&first), std.mem.asBytes(&second));
+
+    // At least one CPU is allowed, and every bit has an id below the limit.
+    var allowed: usize = 0;
+    for (first) |word| allowed += @popCount(word);
+    try testing.expect(allowed > 0);
 }
