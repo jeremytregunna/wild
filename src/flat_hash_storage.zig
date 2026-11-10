@@ -136,6 +136,15 @@ pub const FlatHashStorage = struct {
     // Optional WAL for durability - null means no durability
     durability_manager: ?*wal.DurabilityManager,
 
+    /// Whether this table allocated its own records. `init` does; a partition
+    /// owner that hands `initInPlace` a slice it allocated does not, and frees
+    /// it itself. Getting this wrong either frees a caller's memory or leaks a
+    /// table, and the alignment below is why `deinit` cannot simply call
+    /// `free`: the table is 64-byte aligned so records sit on cache lines, and
+    /// `free` would infer 8 from the record type and be refused.
+    owns_records: bool,
+    records_alignment: std.mem.Alignment,
+
     // L3 domains the machine reports. The whole table is one allocation, so
     // this is a report, not a placement decision: nothing here splits records
     // across zones. A caller that wants per-zone placement has to allocate
@@ -158,8 +167,27 @@ pub const FlatHashStorage = struct {
             std.debug.print("Warning: Detected cache line size {} != 64 bytes. Performance may be suboptimal.\n", .{topology.cache_line_size});
         }
         const records = try allocator.alignedAlloc(CacheLineRecord, @fromBackingInt(@intCast(6)), capacity); // 2^6 = 64
+        var table = Self.initInPlace(topology, allocator, records);
+        table.owns_records = true;
+        return table;
+    }
 
-        // Initialize all records as invalid/empty
+    /// Build a table over memory the caller already owns.
+    ///
+    /// The zero-fill loop is the first touch of every page, and on a machine
+    /// with more than one zone the first touch is what decides which zone a
+    /// page comes from. A partition owner calls this from its own thread,
+    /// pinned to its zone and after binding the range, so the pages it
+    /// touches are the pages it was given instead of wherever the thread that
+    /// happened to call `init` was running.
+    ///
+    /// `capacity` must be a power of two, because the table's slot arithmetic
+    /// is bitwise. A caller that splits a capacity across zones rounds each
+    /// piece down itself, rather than asking this to break the rule.
+    pub fn initInPlace(topology: *const cache_topology.CacheTopology, allocator: std.mem.Allocator, records: []CacheLineRecord) Self {
+        const capacity: u32 = @intCast(records.len);
+        std.debug.assert(std.math.isPowerOfTwo(capacity));
+
         for (records) |*record| {
             record.* = CacheLineRecord.initEmpty();
         }
@@ -173,6 +201,8 @@ pub const FlatHashStorage = struct {
             .sync_enabled = false,
             .sync_mutex = os_compat.Mutex{},
             .durability_manager = null, // Initially no WAL
+            .owns_records = false,
+            .records_alignment = @fromBackingInt(@intCast(6)),
             .l3_domains = @intCast(topology.l3_domains.len),
         };
     }
@@ -204,7 +234,8 @@ pub const FlatHashStorage = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        self.allocator.free(self.records);
+        if (!self.owns_records) return;
+        self.allocator.rawFree(std.mem.sliceAsBytes(self.records), self.records_alignment, 0);
     }
 
     // Get hash position with linear probing for reads

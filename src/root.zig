@@ -24,6 +24,10 @@ pub const CacheLineRecord = flat_hash_storage.CacheLineRecord;
 // key the same way the request path does, so it cannot live inside either.
 pub const partition = @import("partition.zig");
 
+// One table per NUMA zone, each with a pinned owner thread.
+pub const table_set = @import("table_set.zig");
+pub const TableSet = table_set.TableSet;
+
 // Re-export the pieces an end-to-end test needs to start the server and talk
 // to it with the real client.
 pub const wild = @import("wild.zig");

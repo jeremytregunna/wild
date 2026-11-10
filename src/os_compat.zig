@@ -423,6 +423,106 @@ pub fn nodeOfThisCpu() ?u32 {
 }
 
 // ---------------------------------------------------------------------------
+// Memory policy
+//
+// A table lives on one zone, and its pages must come from that zone. Two
+// mechanisms say so, and the partition owner uses both, in this order: bind
+// the range before it is touched, then touch it while pinned. The bind decides
+// where untouched pages will be allocated; the touch is what actually
+// allocates them. Doing one without the other leaves the answer to the
+// scheduler, which is what the table did before.
+//
+// Node numbers here are the kernel's, never the ones CPUID reports. The
+// kernel is free to number nodes differently, and `mbind` with the hardware's
+// number puts a table on the wrong side of the boundary it was meant to stay
+// inside.
+// ---------------------------------------------------------------------------
+
+/// `MPOL_BIND`: allocate only on the nodes in the mask, and fall back nowhere.
+const MPOL_BIND: u64 = 2;
+
+/// `MPOL_F_NODE | MPOL_F_ADDR`: ask `get_mempolicy` which node a page is on.
+const MPOL_F_NODE: u64 = 1;
+const MPOL_F_ADDR: u64 = 2;
+
+/// Node ids the kernel may hand out. `MAX_NUMNODES` is 1024 on x86-64, and a
+/// mask has to describe all of them, not just the one in use.
+pub const max_nodes: u32 = 1024;
+
+/// One bit per node, as `mbind` wants it.
+const NodeMask = [max_nodes / @bitSizeOf(usize)]usize;
+
+/// Bind an already-mapped range to one node, so pages allocated from it from
+/// now on come from that node and nowhere else.
+///
+/// The range must start on a page boundary and its length must be a whole
+/// number of pages; `alignedAlloc` with `pageSize()` gives both when the length
+/// is rounded up. Returns false when the kernel refuses, which it does on a
+/// machine without NUMA or when a policy manager forbids it; the caller then
+/// reports the table as unplaced instead of pretending.
+///
+/// `MPOL_MF_MOVE` is deliberately not passed: moving pages that are already
+/// resident would copy a table that is about to be touched anyway, and on an
+/// untouched range there is nothing to move.
+pub fn bindRangeToNode(ptr: [*]u8, len: usize, node: u32) bool {
+    if (node >= max_nodes) return false;
+    if (len == 0) return false;
+
+    var mask: NodeMask = std.mem.zeroes(NodeMask);
+    mask[node / @bitSizeOf(usize)] |= @as(usize, 1) << @intCast(node % @bitSizeOf(usize));
+
+    const rc = linux.syscall6(
+        .mbind,
+        @intFromPtr(ptr),
+        len,
+        MPOL_BIND,
+        @intFromPtr(&mask),
+        max_nodes,
+        0,
+    );
+    return posix.errno(rc) == .SUCCESS;
+}
+
+/// The node a resident page is on, or null when the kernel will not say.
+///
+/// This is the check that binding and pinning worked, rather than the claim
+/// that they were asked for. A page that is not resident yet has no answer.
+pub fn nodeOfPage(ptr: [*]const u8) ?u32 {
+    var node: u64 = 0;
+    const rc = linux.syscall6(
+        .get_mempolicy,
+        @intFromPtr(&node),
+        0,
+        0,
+        @intFromPtr(ptr),
+        MPOL_F_NODE | MPOL_F_ADDR,
+        0,
+    );
+    if (posix.errno(rc) != .SUCCESS) return null;
+    if (node > std.math.maxInt(u32)) return null;
+    return @intCast(node);
+}
+
+/// Wait until `*word` stops being `expected`, or return when it already is
+/// not. Wakes only when a writer has changed the word, so a lost wakeup
+/// cannot park this thread forever.
+pub fn futexWait(word: *const std.atomic.Value(u32), expected: u32) void {
+    const ptr: *align(4) const u32 = @ptrCast(&word.raw);
+    _ = linux.futex_3arg(ptr, .{ .cmd = .WAIT, .private = true }, expected);
+}
+
+/// Wake up to `count` threads waiting on `word`.
+pub fn futexWake(word: *const std.atomic.Value(u32), count: u32) void {
+    if (count == 0) return;
+    const ptr: *align(4) const u32 = @ptrCast(&word.raw);
+    _ = linux.futex_3arg(
+        ptr,
+        .{ .cmd = .WAKE, .private = true },
+        @min(count, std.math.maxInt(i32)),
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Files and directories
 //
 // Zig 0.16 removed `os_compat.File`, `std.fs.Dir`, and `std.fs.cwd()`. The
@@ -720,6 +820,39 @@ test "reading the affinity mask twice gives the same mask" {
     var allowed: usize = 0;
     for (first) |word| allowed += @popCount(word);
     try testing.expect(allowed > 0);
+}
+
+test "a bound range reports the node it was bound to" {
+    const page = std.heap.pageSize();
+
+    // Page-aligned and a whole number of pages, which is what mbind takes.
+    const bytes = try testing.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(page), page);
+    defer testing.allocator.free(bytes);
+
+    const node = nodeOfThisCpu() orelse return error.SkipZigTest;
+
+    // No NUMA, or a policy manager that forbids binding: nothing to prove, and
+    // the partition code reports the table as unplaced in that case.
+    if (!bindRangeToNode(bytes.ptr, bytes.len, node)) return error.SkipZigTest;
+
+    // The touch is what allocates the page; until it happens there is no node
+    // to report.
+    @memset(bytes, 0xA5);
+
+    try testing.expectEqual(node, nodeOfPage(bytes.ptr).?);
+
+    // A range that is not page-aligned cannot be bound: mbind refuses, and the
+    // caller must not treat a refusal as success.
+    try testing.expect(!bindRangeToNode(bytes.ptr + 1, bytes.len - 1, node));
+}
+
+test "binding to a node that does not exist is refused, not rounded" {
+    const page = std.heap.pageSize();
+    const bytes = try testing.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(page), page);
+    defer testing.allocator.free(bytes);
+
+    try testing.expect(!bindRangeToNode(bytes.ptr, bytes.len, max_nodes));
+    try testing.expect(!bindRangeToNode(bytes.ptr, 0, 0));
 }
 
 test "a pinned thread asks about a CPU and gets a stable node" {
