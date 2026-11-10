@@ -49,6 +49,16 @@ pub const CacheDomain = struct {
     /// each: the first thread of the core when this process may run it, and
     /// otherwise whichever thread it does have.
     physical_cores: u32,
+    /// The kernel's node number for this zone, which is what a placement call
+    /// takes. It is not `node_id`: the hardware's numbering and the kernel's
+    /// are free to differ, because NPS modes and cpusets renumber nodes.
+    ///
+    /// The value is the kernel's own answer, from `getcpu` while the probing
+    /// thread was pinned to a member CPU, so it needs no translation. Null
+    /// means the members did not answer, or did not agree; a wrong node would
+    /// put a table's memory on the far side of a boundary, which is the
+    /// failure this field exists to prevent.
+    os_node: ?u32 = null,
 
     /// One CPU per physical core, taken from the front of the member list.
     pub fn getPhysicalCores(self: *const CacheDomain) []const CpuCore {
@@ -159,6 +169,27 @@ pub const CacheTopology = struct {
             if (!seen) count += 1;
         }
         return count;
+    }
+
+    /// Print one line per L3 domain: its CPUs, the hardware zone, and the
+    /// kernel node a placement call takes. `null` means the CPU or the kernel
+    /// would not say, and a caller must not place anything there.
+    pub fn printZoneReport(self: *const CacheTopology) void {
+        std.debug.print("NUMA zones: {d}\n", .{self.numaNodeCount()});
+        for (self.l3_domains) |domain| {
+            std.debug.print(
+                "  L3 domain {d}: {d} CPUs ({d} physical), L3 {d} KB, zone {?d}, kernel node {?d}, cpus {s}\n",
+                .{
+                    domain.domain_id,
+                    domain.cpus.len,
+                    domain.physical_cores,
+                    domain.cache_size_kb,
+                    domain.node_id,
+                    domain.os_node,
+                    domain.cpu_list_str,
+                },
+            );
+        }
     }
 };
 
@@ -372,6 +403,9 @@ const CpuRecord = struct {
     /// Whether `node_id` is something the CPU said, rather than the zero it
     /// was given when it said nothing.
     node_known: bool,
+    /// The kernel's node for this CPU, asked while the probe held it pinned.
+    /// Null when the kernel would not answer.
+    os_node: ?u32 = null,
     is_primary_thread: bool,
     l2: ?CacheGeometry,
     l3: ?CacheGeometry,
@@ -382,6 +416,7 @@ const CpuSelfReport = struct {
     smt_bits: u8,
     package_bits: u8,
     node_id: u32,
+    os_node: ?u32,
     l2: ?CacheGeometry,
     l3: ?CacheGeometry,
 };
@@ -400,6 +435,7 @@ fn probeThisCpu() ?CpuSelfReport {
         .smt_bits = topo.smt_bits,
         .package_bits = topo.package_bits,
         .node_id = if (node.known) node.node_id else package_id,
+        .os_node = os_compat.nodeOfThisCpu(),
         .l2 = probeCache(info, threads_per_core, 2),
         .l3 = probeCache(info, threads_per_core, 3),
     };
@@ -463,6 +499,7 @@ fn probeCpus(allocator: std.mem.Allocator) ![]CpuRecord {
             .package_id = shrink(report.apic_id, report.package_bits),
             .node_id = report.node_id,
             .node_known = true,
+            .os_node = report.os_node,
             .is_primary_thread = isPrimaryThread(report.apic_id, report.smt_bits),
             .l2 = report.l2,
             .l3 = report.l3,
@@ -521,6 +558,21 @@ fn domainZone(records: []const CpuRecord, members: []const usize) ?u32 {
         }
     }
     return zone;
+}
+
+/// The kernel node a domain may claim: one, only when every member's answer
+/// agreed. A member that could not ask is not agreement, so it yields null.
+fn domainOsNode(records: []const CpuRecord, members: []const usize) ?u32 {
+    var node: ?u32 = null;
+    for (members) |record_index| {
+        const answer = records[record_index].os_node orelse return null;
+        if (node) |known| {
+            if (known != answer) return null;
+        } else {
+            node = answer;
+        }
+    }
+    return node;
 }
 
 fn groupKey(record: CpuRecord, level: Level) [2]u32 {
@@ -600,6 +652,7 @@ fn buildDomains(allocator: std.mem.Allocator, records: []const CpuRecord, level:
             .cpus = ordered.cpus,
             .cpu_list_str = try formatCpuList(allocator, ordered.cpus),
             .node_id = domainZone(records, group.members.items),
+            .os_node = domainOsNode(records, group.members.items),
             .physical_cores = ordered.physical,
         };
         built += 1;
@@ -630,6 +683,7 @@ fn singleDomain(allocator: std.mem.Allocator, records: []const CpuRecord, level:
         .cpus = ordered.cpus,
         .cpu_list_str = try formatCpuList(allocator, ordered.cpus),
         .node_id = domainZone(records, members),
+        .os_node = domainOsNode(records, members),
         .physical_cores = ordered.physical,
     };
     return domains;
@@ -846,6 +900,7 @@ fn syntheticMachine(
                     .package_id = @intCast(package),
                     .node_id = zone_id,
                     .node_known = true,
+                    .os_node = zone_id,
                     .is_primary_thread = thread == 0,
                     .l2 = .{ .size_kb = 1024, .line_size = 64, .sharing_logical = threads_per_core },
                     .l3 = .{ .size_kb = size, .line_size = 64, .sharing_logical = l3_sharing_cores * threads_per_core },
@@ -916,11 +971,31 @@ fn expectDomainInvariants(allocator: std.mem.Allocator, domains: []const CacheDo
                 try testing.expect(record.node_known);
                 try testing.expectEqual(zone, record.node_id);
             }
+
             // Classification and core identity come from the record, never
             // from the order the members arrived in.
             try testing.expectEqual(!record.is_primary_thread, cpu.is_smt_sibling);
             try testing.expectEqual(record.core_id, cpu.physical_core_id);
         }
+
+        // The kernel node is the answer every member gave, or null: a domain
+        // never names a node a member disagreed with, and never drops an
+        // answer the members agreed on.
+        var agreed: ?u32 = null;
+        var disagreed = false;
+        for (domain.cpus) |cpu| {
+            const record = recordFor(records, cpu.cpu_id) orelse return error.UnknownCpu;
+            const answer = record.os_node orelse {
+                disagreed = true;
+                continue;
+            };
+            if (agreed) |known| {
+                if (known != answer) disagreed = true;
+            } else {
+                agreed = answer;
+            }
+        }
+        try testing.expectEqual(if (disagreed) null else agreed, domain.os_node);
 
         // The prefix is one CPU per physical core, and its length is the
         // number of distinct cores in the domain.
@@ -1129,6 +1204,39 @@ test "two zones on one socket: two domains, no CPU in both" {
     try testing.expectEqual(@as(?u32, 0), domains[0].node_id);
     try testing.expectEqual(@as(?u32, 1), domains[1].node_id);
     try expectDomainInvariants(testing.allocator, domains, records);
+}
+
+test "a zone's kernel node is the one every member answered with" {
+    const records = try syntheticMachine(testing.allocator, 16, 1, 2, true, 8, &.{ 32768, 32768 });
+    defer testing.allocator.free(records);
+
+    const domains = try buildDomains(testing.allocator, records, .l3);
+    defer freeDomains(testing.allocator, domains);
+
+    // Both zones answered, and each domain carries its own answer. A domain
+    // that silently defaulted to null would still pass a null check, so this
+    // compares the value.
+    try testing.expectEqual(@as(?u32, 0), domains[0].os_node);
+    try testing.expectEqual(@as(?u32, 1), domains[1].os_node);
+
+    // One member disagreeing withdraws the claim: a domain that spans two
+    // kernel nodes must not name either of them.
+    const split = try syntheticMachine(testing.allocator, 16, 1, 2, true, 8, &.{ 32768, 32768 });
+    defer testing.allocator.free(split);
+    split[1].os_node = 7;
+
+    const disagreeing = try buildDomains(testing.allocator, split, .l3);
+    defer freeDomains(testing.allocator, disagreeing);
+
+    const zone_zero = disagreeing[0];
+    try testing.expect(zone_zero.containsCpu(0));
+    try testing.expectEqual(@as(?u32, null), zone_zero.os_node);
+
+    // A member that never asked withdraws it just as surely.
+    split[1].os_node = null;
+    const silent = try buildDomains(testing.allocator, split, .l3);
+    defer freeDomains(testing.allocator, silent);
+    try testing.expectEqual(@as(?u32, null), silent[0].os_node);
 }
 
 test "two sockets: one domain per package" {

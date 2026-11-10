@@ -237,6 +237,8 @@ pub const WILD = struct {
 
         std.debug.print("\nStorage Statistics:\n", .{});
         std.debug.print("- Used capacity: {}/{} ({d:.1}%)\n", .{ stats.used_capacity, stats.total_capacity, stats.load_factor * 100 });
+
+        self.cache_topology.printZoneReport();
     }
 
     // Hash key utility - unified interface

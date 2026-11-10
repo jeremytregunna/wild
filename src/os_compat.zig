@@ -403,6 +403,25 @@ pub fn cpuSetPut(set: *CpuSet, cpu: u32) void {
     set[word] |= @as(usize, 1) << @intCast(bit);
 }
 
+/// The kernel's NUMA node for the CPU the calling thread is on right now, or
+/// null when the kernel will not answer.
+///
+/// This is the only trustworthy translation from a hardware zone id to the
+/// number a placement call takes. The CPUID leaf `0x8000001E` reports the
+/// hardware's own numbering, and the kernel's numbering is free to differ: NPS
+/// modes split a socket differently, and a cpuset can hide nodes. `getcpu`
+/// asks the kernel, so its answer is the number `mbind` and `numactl` use.
+///
+/// A CPU answers only about itself, so the caller must be pinned to the CPU it
+/// wants to ask about. `cache_topology.zig` already is, one CPU at a time.
+pub fn nodeOfThisCpu() ?u32 {
+    var node: usize = 0;
+    const rc = linux.getcpu(null, &node);
+    if (posix.errno(rc) != .SUCCESS) return null;
+    if (node > std.math.maxInt(u32)) return null;
+    return @intCast(node);
+}
+
 // ---------------------------------------------------------------------------
 // Files and directories
 //
@@ -701,4 +720,34 @@ test "reading the affinity mask twice gives the same mask" {
     var allowed: usize = 0;
     for (first) |word| allowed += @popCount(word);
     try testing.expect(allowed > 0);
+}
+
+test "a pinned thread asks about a CPU and gets a stable node" {
+    var allowed: CpuSet = undefined;
+    if (!cpuAffinityGet(&allowed)) return error.SkipZigTest;
+
+    var first_cpu: ?u32 = null;
+    var cpu_id: u32 = 0;
+    while (cpu_id < max_cpus) : (cpu_id += 1) {
+        if (cpuSetContains(&allowed, cpu_id)) {
+            first_cpu = cpu_id;
+            break;
+        }
+    }
+    const pinned = first_cpu orelse return error.SkipZigTest;
+
+    var only_this = std.mem.zeroes(CpuSet);
+    cpuSetPut(&only_this, pinned);
+    if (!cpuAffinitySet(&only_this)) return error.SkipZigTest;
+    defer _ = cpuAffinitySet(&allowed);
+
+    const node = nodeOfThisCpu() orelse return error.SkipZigTest;
+
+    // The thread cannot move off the CPU it is pinned to, so the kernel's
+    // answer cannot change between two calls.
+    try testing.expectEqual(node, nodeOfThisCpu().?);
+
+    // A node id is a small dense number; anything near the cap is a misread
+    // return value, not an answer.
+    try testing.expect(node < max_cpus);
 }
