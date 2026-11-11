@@ -785,6 +785,112 @@ fn testTopology(allocator: std.mem.Allocator) !cache_topology.CacheTopology {
     return cache_topology.analyzeCacheTopology(allocator);
 }
 
+test "pinning takes the physical cores of a domain and nothing else" {
+    // Build a domain by hand: two cores with their SMT siblings, which is the
+    // shape a real domain has and the shape pinning has to cut in half.
+    const cores = try testing.allocator.alloc(cache_topology.CpuCore, 4);
+    defer testing.allocator.free(cores);
+    // One CPU per core first, then the siblings, which is the order the
+    // accessor depends on and the order a real domain has.
+    cores[0] = .{ .cpu_id = 4, .is_smt_sibling = false, .physical_core_id = 2 };
+    cores[1] = .{ .cpu_id = 5, .is_smt_sibling = false, .physical_core_id = 3 };
+    cores[2] = .{ .cpu_id = 12, .is_smt_sibling = true, .physical_core_id = 2 };
+    cores[3] = .{ .cpu_id = 13, .is_smt_sibling = true, .physical_core_id = 3 };
+    const domain: cache_topology.CacheDomain = .{
+        .domain_id = 0,
+        .cache_size_kb = 96,
+        .cpus = cores,
+        .cpu_list_str = "4-5,12-13",
+        .node_id = 0,
+        .physical_cores = 2,
+    };
+
+    var before: os_compat.CpuSet = undefined;
+    // If the process may not read its own mask there is nothing to compare
+    // against, and pinning cannot be tested safely on this machine.
+    if (!os_compat.cpuAffinityGet(&before)) return;
+    defer {
+        if (!os_compat.cpuAffinitySet(&before)) {
+            std.debug.print("Warning: could not restore CPU affinity after the pinning test.\n", .{});
+        }
+    }
+
+    try testing.expect(pinToDomain(&domain));
+
+    var after: os_compat.CpuSet = undefined;
+    try testing.expect(os_compat.cpuAffinityGet(&after));
+
+    // The two primary threads, and neither sibling: a pinned owner that shares
+    // its core with a sibling has a neighbour stealing its cache.
+    try testing.expect(os_compat.cpuSetContains(&after, 4));
+    try testing.expect(os_compat.cpuSetContains(&after, 5));
+    try testing.expect(!os_compat.cpuSetContains(&after, 12));
+    try testing.expect(!os_compat.cpuSetContains(&after, 13));
+
+    // Nothing outside the domain, whatever else the machine has.
+    var cpu: u32 = 0;
+    while (cpu < os_compat.max_cpus) : (cpu += 1) {
+        if (os_compat.cpuSetContains(&after, cpu)) {
+            try testing.expect(cpu == 4 or cpu == 5);
+        }
+    }
+}
+
+test "a domain with no physical-core prefix still pins to its members" {
+    // The degraded domain: grouping failed, so there is no core prefix to
+    // take. Not pinning at all would send the owner's writes across a
+    // boundary; pinning to everything it has is the useful fallback.
+    const cores = try testing.allocator.alloc(cache_topology.CpuCore, 2);
+    defer testing.allocator.free(cores);
+    cores[0] = .{ .cpu_id = 6, .is_smt_sibling = false, .physical_core_id = 3 };
+    cores[1] = .{ .cpu_id = 7, .is_smt_sibling = false, .physical_core_id = 7 };
+    const domain: cache_topology.CacheDomain = .{
+        .domain_id = 0,
+        .cache_size_kb = 96,
+        .cpus = cores,
+        .cpu_list_str = "6-7",
+        .node_id = null,
+        .physical_cores = 0,
+    };
+
+    var before: os_compat.CpuSet = undefined;
+    if (!os_compat.cpuAffinityGet(&before)) return;
+    defer {
+        if (!os_compat.cpuAffinitySet(&before)) {
+            std.debug.print("Warning: could not restore CPU affinity after the pinning test.\n", .{});
+        }
+    }
+
+    try testing.expect(pinToDomain(&domain));
+
+    var after: os_compat.CpuSet = undefined;
+    try testing.expect(os_compat.cpuAffinityGet(&after));
+    try testing.expect(os_compat.cpuSetContains(&after, 6));
+    try testing.expect(os_compat.cpuSetContains(&after, 7));
+}
+
+test "placing a table leaves the calling thread's mask as it found it" {
+    var topology = try testTopology(testing.allocator);
+    defer topology.deinit();
+
+    var before: os_compat.CpuSet = undefined;
+    if (!os_compat.cpuAffinityGet(&before)) return;
+
+    // Placing moves the caller to a zone to first-touch its memory there. It
+    // has to put the mask back, or every later caller on this thread —
+    // including unrelated work — would run on one zone.
+    const records = try testing.allocator.alignedAlloc(CacheLineRecord, @fromBackingInt(@intCast(6)), 64);
+    defer testing.allocator.free(records);
+
+    var table: Table = .{ .id = 0, .domain = if (topology.l3_domains.len > 0) &topology.l3_domains[0] else null };
+    placeInCaller(&table, &topology, testing.allocator, records);
+    defer table.storage.deinit();
+
+    var after: os_compat.CpuSet = undefined;
+    try testing.expect(os_compat.cpuAffinityGet(&after));
+    try testing.expectEqualSlices(usize, &before, &after);
+}
+
 test "one table runs on the caller and needs no owner thread" {
     var topology = try testTopology(testing.allocator);
     defer topology.deinit();
