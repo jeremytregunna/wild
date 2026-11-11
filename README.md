@@ -58,7 +58,7 @@ WILD leverages modern CPU architecture for extreme performance:
 ### Core Design
 - **Cache-Line Aligned Records**: 64-byte records fit exactly in CPU cache lines
 - **Flat Hash Storage**: Linear probing with bitwise operations
-- **Zone-Local Tables**: CPUID on every CPU the process may use reports cores, SMT siblings, L2/L3 domains, cache line size, and the NUMA zone each cache sits in, including two zones on one socket. Each zone gets its own table, bound to that zone's kernel node and first touched by a thread pinned to its cores, so a write does not cross a zone boundary. One zone means one table and no extra thread.
+- **Zone-Local Tables** ([docs/NUMA.md](docs/NUMA.md)): CPUID on every CPU the process may use reports cores, SMT siblings, L2/L3 domains, cache line size, and the NUMA zone each cache sits in, including two zones on one socket. Each zone gets its own table, bound to that zone's kernel node and first touched by a thread pinned to its cores, so a write does not cross a zone boundary. One zone means one table and no extra thread.
 - **Zero Runtime Allocation**: Static allocator eliminates allocation overhead
 - **One Owning Thread per Table**: A table is driven by a single thread. Replication and snapshot walks take a storage guard first, so a second thread cannot shift records under a reader.
 - **Replication**: Primary-replica model for read scaling
@@ -237,6 +237,8 @@ Measurements, and the limits of both claims: [docs/bench/README.md](bench/README
 | [docs/WIRE_PROTOCOL.md](docs/WIRE_PROTOCOL.md) | Binary protocol specification |
 | [docs/REPLICATION.md](docs/REPLICATION.md) | Replication setup and management |
 | [docs/SECURITY.md](docs/SECURITY.md) | Authentication and security features |
+| [docs/WAL.md](docs/WAL.md) | Write-ahead log design and guarantees |
+| [docs/NUMA.md](docs/NUMA.md) | Zones, tables, and placement |
 | [docs/API.md](docs/API.md) | Client API reference |
 
 ## Use Cases
